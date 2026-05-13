@@ -5,6 +5,7 @@ Tests the discover() and discover_one() functions with mocked sockets.
 """
 import pytest
 import socket
+from cryptography.fernet import Fernet
 from unittest.mock import Mock, patch, MagicMock, call
 from discovery_client import (
     ClientConfig,
@@ -19,6 +20,7 @@ from discovery_client.network.socket import (
     receive_responses,
     parse_response,
     discover_servers_single_broadcast,
+    _outgoing_discovery_payload,
     DEFAULT_BROADCAST_ADDRESS,
 )
 
@@ -158,6 +160,60 @@ class TestSendDiscoveryRequest:
         )
 
 
+class TestOutgoingDiscoveryPayload:
+    """Fernet-wrapped outbound payload when encryption is enabled."""
+
+    def test_plain_config_sends_raw_message_bytes(self):
+        cfg = ClientConfig()
+        assert _outgoing_discovery_payload(cfg) == b"DISCOVER_SERVER"
+
+    def test_encrypted_config_returns_fernet_token(self):
+        key = Fernet.generate_key().decode("ascii")
+        cfg = ClientConfig(encryption_enabled=True, secret_key=key)
+        out = _outgoing_discovery_payload(cfg)
+        assert out != cfg.discovery_message
+        plain = Fernet(key.encode("ascii")).decrypt(out)
+        assert plain == b"DISCOVER_SERVER"
+
+
+class TestReceiveResponsesEncrypted:
+    """receive_responses with ClientConfig.encryption_enabled."""
+
+    def test_receive_encrypted_valid_responses(self):
+        key = Fernet.generate_key().decode("ascii")
+        config = ClientConfig(encryption_enabled=True, secret_key=key)
+        f = Fernet(key.encode("ascii"))
+        p1 = f.encrypt(b"SERVER_IP:192.168.1.100:8000")
+        p2 = f.encrypt(b"SERVER_IP:10.0.0.5:9000")
+        mock_sock = MagicMock()
+        mock_sock.recvfrom.side_effect = [ (p1, ("192.168.1.100", 12345)), (p2, ("10.0.0.5", 12346)), socket.timeout ]
+
+        results = receive_responses(mock_sock, config)
+        assert len(results) == 2
+        assert results[0].ip == "192.168.1.100"
+        assert results[0].port == 8000
+        assert results[0].raw_response == b"SERVER_IP:192.168.1.100:8000"
+        assert results[1].ip == "10.0.0.5"
+
+    def test_receive_encrypted_undecryptable_ignored(self):
+        key = Fernet.generate_key().decode("ascii")
+        config = ClientConfig(encryption_enabled=True, secret_key=key)
+        mock_sock = MagicMock()
+        mock_sock.recvfrom.side_effect = [(b"not-a-fernet-token", ("1.2.3.4", 1)), socket.timeout]
+        results = receive_responses(mock_sock, config)
+        assert results == []
+
+    def test_receive_encrypted_invalid_plaintext_after_decrypt_ignored(self):
+        key = Fernet.generate_key().decode("ascii")
+        config = ClientConfig(encryption_enabled=True, secret_key=key)
+        f = Fernet(key.encode("ascii"))
+        bad = f.encrypt(b"WRONG_MESSAGE")
+        mock_sock = MagicMock()
+        mock_sock.recvfrom.side_effect = [(bad, ("1.2.3.4", 1)), socket.timeout]
+        results = receive_responses(mock_sock, config)
+        assert results == []
+
+
 class TestReceiveResponses:
     """Tests for receive_responses function."""
     
@@ -265,7 +321,8 @@ class TestDiscoverServersSingleBroadcast:
             mock_sock,
             b"DISCOVER_SERVER",
             9999,
-            DEFAULT_BROADCAST_ADDRESS
+            DEFAULT_BROADCAST_ADDRESS,
+            redact_payload=False,
         )
         # max_responses is optional and defaults to None
         mock_receive.assert_called_once_with(mock_sock, config)

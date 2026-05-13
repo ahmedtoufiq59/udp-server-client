@@ -6,7 +6,7 @@ environment variable support.
 """
 import os
 from dataclasses import dataclass, field
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Any
 
 
 def _normalize_to_bytes(value: Union[str, bytes]) -> bytes:
@@ -48,6 +48,11 @@ class ClientConfig:
         enable_subnet_scan: Whether to enable subnet scan (default: True). Reserved for future use.
         interfaces_whitelist: If set, only these interface names are used (default: None).
         interfaces_blacklist: If set, these interface names are excluded (default: None).
+        encryption_enabled: When True, discovery requests and responses use Fernet
+            (must match server ``DISCOVERY_ENCRYPTION_ENABLED``). Default: False.
+        secret_key: Fernet key (``Fernet.generate_key()`` string). Required when
+            ``encryption_enabled`` is True. Env: ``DISCOVERY_CLIENT_SECRET_KEY`` or
+            ``DISCOVERY_SECRET_KEY`` (fallback for parity with server env).
     """
     discovery_port: int = 9999
     discovery_message: bytes = field(default_factory=lambda: b"DISCOVER_SERVER")
@@ -57,6 +62,9 @@ class ClientConfig:
     enable_subnet_scan: bool = True
     interfaces_whitelist: Optional[List[str]] = None
     interfaces_blacklist: Optional[List[str]] = None
+    encryption_enabled: bool = False
+    secret_key: Optional[str] = None
+    _fernet: Any = field(init=False, repr=False, compare=False, default=None)
     
     def __post_init__(self):
         """Validate and normalize configuration values."""
@@ -88,6 +96,18 @@ class ClientConfig:
         # Validate retries
         if self.retries < 0:
             raise ValueError(f"retries must be non-negative, got {self.retries}")
+
+        if self.encryption_enabled:
+            if not (self.secret_key and str(self.secret_key).strip()):
+                raise ValueError(
+                    "encryption_enabled requires a non-empty secret_key "
+                    "(DISCOVERY_CLIENT_SECRET_KEY / DISCOVERY_SECRET_KEY or secret_key=...)"
+                )
+            from discovery_client.crypto_util import build_fernet
+
+            object.__setattr__(self, "_fernet", build_fernet(str(self.secret_key).strip()))
+        else:
+            object.__setattr__(self, "_fernet", None)
     
     @classmethod
     def from_env(cls, **overrides: object) -> 'ClientConfig':
@@ -106,6 +126,9 @@ class ClientConfig:
             ENABLE_SUBNET_SCAN: Enable subnet scan (bool: true/1/yes/on)
             INTERFACES_WHITELIST: Comma-separated interface names
             INTERFACES_BLACKLIST: Comma-separated interface names
+            ENCRYPTION_ENABLED: Fernet mode (bool). Reads ``DISCOVERY_CLIENT_ENCRYPTION_ENABLED``
+            first, then ``DISCOVERY_ENCRYPTION_ENABLED`` (same name as server). Requires a secret key.
+            SECRET_KEY: Fernet key (also reads DISCOVERY_SECRET_KEY if this is unset)
 
         Args:
             **overrides: Runtime overrides; take precedence over env vars and defaults.
@@ -174,6 +197,21 @@ class ClientConfig:
             blacklist = os.environ.get(f"{env_prefix}INTERFACES_BLACKLIST")
             if blacklist:
                 config_dict['interfaces_blacklist'] = _parse_list(blacklist)
+
+        # Encrypted discovery (Fernet)
+        if 'encryption_enabled' not in overrides:
+            enc = os.environ.get(f"{env_prefix}ENCRYPTION_ENABLED")
+            if not enc:
+                enc = os.environ.get("DISCOVERY_ENCRYPTION_ENABLED")
+            if enc:
+                config_dict['encryption_enabled'] = _parse_bool(enc)
+
+        if 'secret_key' not in overrides:
+            sk = os.environ.get(f"{env_prefix}SECRET_KEY")
+            if not sk:
+                sk = os.environ.get("DISCOVERY_SECRET_KEY")
+            if sk:
+                config_dict['secret_key'] = sk.strip()
         
         # Merge env vars with overrides (overrides take precedence)
         config_dict.update(overrides)

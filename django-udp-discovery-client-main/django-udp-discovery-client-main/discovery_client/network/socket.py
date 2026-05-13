@@ -11,6 +11,7 @@ import socket
 from typing import List, Tuple, Optional, Set
 from discovery_client.config import ClientConfig
 from discovery_client.results import DiscoveryResult
+from discovery_client.crypto_util import encrypt_payload, decrypt_payload
 from discovery_client.network.interfaces import InterfaceInfo, select_interfaces
 from discovery_client.network.utils import broadcast_from_ip_and_mask
 
@@ -20,6 +21,16 @@ logger = logging.getLogger("django_udp_discovery_client")
 
 # Default broadcast address for single broadcast discovery
 DEFAULT_BROADCAST_ADDRESS = "255.255.255.255"
+
+
+def _outgoing_discovery_payload(config: ClientConfig) -> bytes:
+    """Plain discovery message bytes, or Fernet-encrypted payload when enabled."""
+    if not config.encryption_enabled:
+        return config.discovery_message
+    fernet = getattr(config, "_fernet", None)
+    if fernet is None:
+        raise RuntimeError("ClientConfig encryption_enabled without Fernet instance")
+    return encrypt_payload(config.discovery_message, fernet)
 
 
 def parse_response(response: bytes, prefix: bytes) -> Optional[Tuple[str, int]]:
@@ -123,23 +134,29 @@ def send_discovery_request(
     sock: socket.socket,
     message: bytes,
     port: int,
-    broadcast_address: str = DEFAULT_BROADCAST_ADDRESS
+    broadcast_address: str = DEFAULT_BROADCAST_ADDRESS,
+    *,
+    redact_payload: bool = False,
 ) -> None:
     """
     Send a UDP discovery request to the broadcast address.
     
     Args:
         sock: UDP socket (must have SO_BROADCAST enabled)
-        message: Discovery message to send (e.g., b"DISCOVER_SERVER")
+        message: Discovery message to send (plain or pre-encrypted bytes)
         port: UDP port to send to
         broadcast_address: Broadcast address (default: "255.255.255.255")
+        redact_payload: If True, do not log raw message bytes (encrypted payloads)
     
     Raises:
         OSError: If send fails
     """
     try:
         logger.info(f"Sending discovery request to {broadcast_address}:{port}")
-        logger.debug(f"Discovery message: {message!r}")
+        if redact_payload:
+            logger.debug("Discovery payload: %s bytes (encrypted)", len(message))
+        else:
+            logger.debug(f"Discovery message: {message!r}")
         sock.sendto(message, (broadcast_address, port))
         logger.debug(f"Discovery request sent successfully to {broadcast_address}:{port}")
     except OSError as e:
@@ -168,7 +185,9 @@ def receive_responses(
     
     Note:
         This function will continue receiving until socket timeout.
-        Invalid responses (wrong prefix) are silently ignored.
+        Invalid responses (wrong prefix) are ignored. When ``config.encryption_enabled``
+        is True, datagrams are decrypted with Fernet first; undecryptable packets are
+        ignored without raising.
     """
     results = []
     logger.debug("Starting to receive discovery responses")
@@ -177,16 +196,45 @@ def receive_responses(
         try:
             # Receive response
             data, addr = sock.recvfrom(4096)  # Max UDP packet size is typically 65507
-            logger.debug(f"Received response from {addr[0]}:{addr[1]}: {data!r}")
+
+            if config.encryption_enabled:
+                logger.debug(
+                    "Received UDP datagram from %s:%s (%s bytes)",
+                    addr[0],
+                    addr[1],
+                    len(data),
+                )
+                fernet = getattr(config, "_fernet", None)
+                if fernet is None:
+                    logger.debug("Ignoring response: encryption enabled but Fernet is missing")
+                    continue
+                payload = decrypt_payload(data, fernet)
+                if payload is None:
+                    logger.debug(
+                        "Ignoring undecryptable discovery response from %s:%s",
+                        addr[0],
+                        addr[1],
+                    )
+                    continue
+            else:
+                payload = data
+                logger.debug(f"Received response from {addr[0]}:{addr[1]}: {data!r}")
             
             # Parse response
-            parsed = parse_response(data, config.response_prefix)
+            parsed = parse_response(payload, config.response_prefix)
             if parsed is None:
-                # Invalid response, ignore
-                logger.warning(
-                    f"Received invalid response from {addr[0]}:{addr[1]}: "
-                    f"does not start with prefix {config.response_prefix!r}"
-                )
+                if config.encryption_enabled:
+                    logger.debug(
+                        "Ignoring discovery response with invalid payload after decrypt "
+                        "from %s:%s",
+                        addr[0],
+                        addr[1],
+                    )
+                else:
+                    logger.warning(
+                        f"Received invalid response from {addr[0]}:{addr[1]}: "
+                        f"does not start with prefix {config.response_prefix!r}"
+                    )
                 continue
             
             ip, port = parsed
@@ -197,7 +245,7 @@ def receive_responses(
                 result = DiscoveryResult(
                     ip=ip,
                     port=port,
-                    raw_response=data,
+                    raw_response=payload,
                     extra={"source_address": addr[0]}  # Store source IP for reference
                 )
                 results.append(result)
@@ -271,9 +319,10 @@ def discover_servers_single_broadcast(
         # Send discovery request
         send_discovery_request(
             sock,
-            config.discovery_message,
+            _outgoing_discovery_payload(config),
             config.discovery_port,
-            broadcast_address
+            broadcast_address,
+            redact_payload=config.encryption_enabled,
         )
         
         # Receive responses
@@ -589,9 +638,10 @@ def discover_servers_multi_interface(config: ClientConfig) -> List[DiscoveryResu
                 # Send discovery request to this interface's broadcast
                 send_discovery_request(
                     sock,
-                    config.discovery_message,
+                    _outgoing_discovery_payload(config),
                     config.discovery_port,
-                    broadcast_addr
+                    broadcast_addr,
+                    redact_payload=config.encryption_enabled,
                 )
                 successful_sends += 1
             except ValueError as e:

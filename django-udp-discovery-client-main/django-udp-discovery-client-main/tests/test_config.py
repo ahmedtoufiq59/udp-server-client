@@ -6,6 +6,7 @@ and that runtime kwargs override env vars and defaults.
 """
 import os
 import pytest
+from cryptography.fernet import Fernet
 from discovery_client import load_config, ClientConfig
 
 
@@ -20,6 +21,9 @@ class TestLoadConfigEnvPriority:
             "DISCOVERY_CLIENT_RESPONSE_PREFIX", "DISCOVERY_CLIENT_TIMEOUT",
             "DISCOVERY_CLIENT_RETRIES", "DISCOVERY_CLIENT_ENABLE_SUBNET_SCAN",
             "DISCOVERY_CLIENT_INTERFACES_WHITELIST", "DISCOVERY_CLIENT_INTERFACES_BLACKLIST",
+            "DISCOVERY_CLIENT_ENCRYPTION_ENABLED", "DISCOVERY_ENCRYPTION_ENABLED",
+            "DISCOVERY_CLIENT_SECRET_KEY",
+            "DISCOVERY_SECRET_KEY",
         ]
         saved = {k: os.environ.pop(k, None) for k in env_keys}
         try:
@@ -29,6 +33,8 @@ class TestLoadConfigEnvPriority:
             assert config.response_prefix == b"SERVER_IP:"
             assert config.timeout == 5.0
             assert config.retries == 3
+            assert config.encryption_enabled is False
+            assert config.secret_key is None
         finally:
             for k, v in saved.items():
                 if v is not None:
@@ -81,3 +87,43 @@ class TestLoadConfigEnvPriority:
         finally:
             os.environ.pop("DISCOVERY_CLIENT_INTERFACES_WHITELIST", None)
             os.environ.pop("DISCOVERY_CLIENT_INTERFACES_BLACKLIST", None)
+
+    def test_load_config_encryption_from_env(self):
+        key = Fernet.generate_key().decode("ascii")
+        os.environ["DISCOVERY_CLIENT_ENCRYPTION_ENABLED"] = "true"
+        os.environ["DISCOVERY_CLIENT_SECRET_KEY"] = key
+        try:
+            config = load_config()
+            assert config.encryption_enabled is True
+            assert config.secret_key == key
+        finally:
+            os.environ.pop("DISCOVERY_CLIENT_ENCRYPTION_ENABLED", None)
+            os.environ.pop("DISCOVERY_CLIENT_SECRET_KEY", None)
+
+    def test_load_config_secret_fallback_discovery_secret_key_env(self):
+        key = Fernet.generate_key().decode("ascii")
+        saved_client = os.environ.pop("DISCOVERY_CLIENT_SECRET_KEY", None)
+        os.environ["DISCOVERY_SECRET_KEY"] = key
+        try:
+            config = load_config(encryption_enabled=True)
+            assert config.secret_key == key
+        finally:
+            os.environ.pop("DISCOVERY_SECRET_KEY", None)
+            if saved_client is not None:
+                os.environ["DISCOVERY_CLIENT_SECRET_KEY"] = saved_client
+
+    def test_load_config_encryption_from_server_named_env(self):
+        key = Fernet.generate_key().decode("ascii")
+        os.environ["DISCOVERY_ENCRYPTION_ENABLED"] = "1"
+        os.environ["DISCOVERY_CLIENT_SECRET_KEY"] = key
+        try:
+            config = load_config()
+            assert config.encryption_enabled is True
+            assert config.secret_key == key
+        finally:
+            os.environ.pop("DISCOVERY_ENCRYPTION_ENABLED", None)
+            os.environ.pop("DISCOVERY_CLIENT_SECRET_KEY", None)
+
+    def test_encryption_enabled_requires_secret_key(self):
+        with pytest.raises(ValueError, match="secret_key"):
+            ClientConfig(encryption_enabled=True)

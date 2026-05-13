@@ -46,6 +46,10 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
 ]
 
+dependencies = [
+    "cryptography>=42.0.0",
+]
+
 [project.optional-dependencies]
 network = [
     "netifaces>=0.11.0",

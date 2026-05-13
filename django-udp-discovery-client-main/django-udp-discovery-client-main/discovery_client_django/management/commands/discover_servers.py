@@ -8,7 +8,7 @@ Usage:
 """
 from django.core.management.base import BaseCommand
 from django.core.management import CommandError
-from discovery_client import discover, ClientConfig, DiscoveryResult
+from discovery_client import discover, ClientConfig, DiscoveryResult, load_config
 from discovery_client.network.socket import (
     detect_segmented_network,
     format_segmented_network_warning,
@@ -63,38 +63,50 @@ class Command(BaseCommand):
             action='store_true',
             help='Enable verbose output',
         )
+        parser.add_argument(
+            '--encryption',
+            action='store_true',
+            help=(
+                'Use Fernet-encrypted discovery (must match server '
+                'DISCOVERY_ENCRYPTION_ENABLED). Secret: DISCOVERY_CLIENT_SECRET_KEY '
+                'or DISCOVERY_SECRET_KEY env var.'
+            ),
+        )
     
     def handle(self, *args, **options):
         """Execute the discovery command."""
-        # Build configuration from command-line arguments
         config_kwargs = {
             'timeout': options['timeout'],
             'discovery_port': options['port'],
             'discovery_message': options['message'].encode('utf-8'),
             'response_prefix': options['response_prefix'].encode('utf-8'),
         }
-        
+
+        if options['encryption']:
+            config_kwargs['encryption_enabled'] = True
+
         # Handle interface filters
         if options['interfaces_whitelist']:
             config_kwargs['interfaces_whitelist'] = [
                 name.strip() for name in options['interfaces_whitelist'].split(',')
             ]
-        
+
         if options['interfaces_blacklist']:
             config_kwargs['interfaces_blacklist'] = [
                 name.strip() for name in options['interfaces_blacklist'].split(',')
             ]
-        
-        # Create configuration
+
         try:
-            config = ClientConfig(**config_kwargs)
+            config = load_config(**config_kwargs)
         except ValueError as e:
             raise CommandError(f"Invalid configuration: {e}")
-        
+
         # Perform discovery
         if options['verbose']:
             self.stdout.write(
-                self.style.SUCCESS(f'Starting discovery (timeout: {config.timeout}s, port: {config.discovery_port})...')
+                self.style.SUCCESS(
+                    f'Starting discovery (timeout: {config.timeout}s, port: {config.discovery_port})...'
+                )
             )
         
         try:

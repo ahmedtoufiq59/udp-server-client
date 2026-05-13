@@ -32,9 +32,11 @@ def discover(config: Optional[ClientConfig] = None) -> List[DiscoveryResult]:
     """
     Discover django-udp-discovery servers on the local network.
 
-    Sends UDP discovery requests (DISCOVER_SERVER) to the network and collects
-    responses from servers that respond with the SERVER_IP: prefix. Uses
-    multi-interface broadcast; results are deduplicated by (ip, port).
+    Sends UDP discovery requests to the network and collects responses from
+    servers that use the ``SERVER_IP:`` response prefix. Uses multi-interface
+    broadcast; results are deduplicated by (ip, port). When
+    ``ClientConfig.encryption_enabled`` is True, requests and responses are
+    wrapped with Fernet (same key as server ``DISCOVERY_SECRET_KEY``).
 
     Args:
         config: Optional ClientConfig. If None, uses load_config() (defaults + env).
