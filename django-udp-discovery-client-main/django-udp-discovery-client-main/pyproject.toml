@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "django-udp-discovery-client"
+version = "1.0.0"
+description = "Client library for discovering django-udp-discovery servers on local networks using UDP broadcast"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [
+    {name = "OgroProjukti", email="ogroprojukti@gmail.com"}, {name = "Md. Fatin Shadab Turja", email="fatinshadab123@gmail.com"}
+]
+
+keywords = [
+    "django",
+    "udp",
+    "discovery",
+    "service-discovery",
+    "network",
+    "broadcast",
+    "django-udp-discovery",
+    "client",
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: Django",
+    "Framework :: Django :: 3.2",
+    "Framework :: Django :: 4.0",
+    "Framework :: Django :: 4.1",
+    "Framework :: Django :: 4.2",
+    "Framework :: Django :: 5.0",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Networking",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+
+[project.optional-dependencies]
+network = [
+    "netifaces>=0.11.0",
+    "ifaddr>=0.2.0",
+]
+django = [
+    "Django>=3.2",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+all = [
+    "netifaces>=0.11.0",
+    "ifaddr>=0.2.0",
+    "Django>=3.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/Ogro-Projukti/django-udp-discovery-client"
+Repository = "https://github.com/Ogro-Projukti/django-udp-discovery-client"
+Issues = "https://github.com/Ogro-Projukti/django-udp-discovery-client/issues"
+Documentation = "https://github.com/Ogro-Projukti/django-udp-discovery-client#readme"
+
+[tool.setuptools.packages.find]
+# Wheel and sdist: only these packages are shipped (audit, dev_test, tests, docs excluded via MANIFEST.in)
+where = ["."]
+include = ["discovery_client*", "discovery_client_django*"]
+
+[tool.setuptools.package-data]
+discovery_client = ["py.typed"]
+

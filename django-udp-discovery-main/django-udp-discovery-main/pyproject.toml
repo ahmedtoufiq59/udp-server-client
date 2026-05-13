@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "django-udp-discovery"
+version = "1.0.0"
+description = "A Django application that provides UDP-based service discovery functionality"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+authors = [
+    {name = "Ogro-Projukti"},
+    {name = "Md. Fatin Shadab Turja"}
+]
+keywords = [
+    "django",
+    "udp",
+    "discovery",
+    "service-discovery",
+    "network",
+    "server-discovery",
+    "udp-discovery",
+    "intranet",
+    "broadcast"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: Django",
+    "Framework :: Django :: 2.2",
+    "Framework :: Django :: 3.2",
+    "Framework :: Django :: 4.0",
+    "Framework :: Django :: 4.1",
+    "Framework :: Django :: 4.2",
+    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.1",
+    "Framework :: Django :: 5.2",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Networking",
+]
+
+dependencies = [
+    "Django>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-django>=4.5.0",
+    "black>=22.0",
+    "flake8>=4.0",
+    "mypy>=0.950",
+]
+
+[project.urls]
+Homepage = "https://github.com/Ogro-Projukti/django-udp-discovery"
+Documentation = "https://github.com/Ogro-Projukti/django-udp-discovery#readme"
+Repository = "https://github.com/Ogro-Projukti/django-udp-discovery"
+Issues = "https://github.com/Ogro-Projukti/django-udp-discovery/issues"
+
+[tool.hatch.build]
+include = [
+    "LICENSE",
+    "README.md",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/django_udp_discovery"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "LICENSE",
+    "README.md",
+    "src/django_udp_discovery",
+]
+

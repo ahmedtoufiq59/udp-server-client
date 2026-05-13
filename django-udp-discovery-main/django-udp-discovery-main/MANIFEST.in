@@ -1,0 +1,37 @@
+# Include license and project README
+include LICENSE
+include README.md
+
+# Exclude test files from distribution (must be before recursive-include)
+exclude src/django_udp_discovery/tests.py
+global-exclude tests.py
+recursive-exclude src/django_udp_discovery tests.py
+prune src/django_udp_discovery/tests
+
+# Include package-level README inside django_udp_discovery
+recursive-include src/django_udp_discovery *.md
+
+# Include all management commands
+recursive-include src/django_udp_discovery/management *.py
+
+# Include all Python files in the package (tests.py already excluded above)
+recursive-include src/django_udp_discovery *.py
+
+# Exclude unnecessary files
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__
+global-exclude .pytest_cache
+global-exclude *.log
+global-exclude .DS_Store
+
+# Extra safety exclusions
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+recursive-exclude * .pytest_cache
+recursive-exclude * .coverage
+recursive-exclude * htmlcov
+recursive-exclude * .tox
+recursive-exclude * .eggs
+recursive-exclude * *.egg-info
+recursive-exclude src/django_udp_discovery/tests *
