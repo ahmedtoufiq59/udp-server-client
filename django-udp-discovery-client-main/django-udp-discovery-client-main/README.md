@@ -11,6 +11,7 @@ Pure Python client for discovering [django-udp-discovery](https://github.com/Ogr
 - [Quick Start](#quick-start)
 - [Django Integration](#django-integration)
 - [Configuration](#configuration)
+- [Optional encrypted discovery (Fernet)](#optional-encrypted-discovery-fernet)
 - [Verifying Installation](#verifying-installation)
 - [Logging](#logging)
 - [Technical Considerations](#technical-considerations)
@@ -27,6 +28,7 @@ Pure Python client for discovering [django-udp-discovery](https://github.com/Ogr
 - **Django integration (optional)** — Management command `python manage.py discover_servers` when `discovery_client_django` is in `INSTALLED_APPS`; install with `[django]` extra.
 - **Configurable** — `ClientConfig` / `load_config()` with env vars (`DISCOVERY_CLIENT_*`) and runtime overrides; interface whitelist/blacklist.
 - **Cross-platform** — Windows, Linux, macOS. Optional deps: `netifaces` or `ifaddr` for interface enumeration, Django for the management command.
+- **Optional Fernet encryption** — Match server `DISCOVERY_ENCRYPTION_ENABLED` using the same pre-shared key; see [Optional encrypted discovery (Fernet)](#optional-encrypted-discovery-fernet).
 
 ---
 
@@ -138,6 +140,8 @@ Use `ClientConfig` or `load_config()`. Priority: **defaults** &lt; **environment
 | `DISCOVERY_CLIENT_ENABLE_SUBNET_SCAN` | Subnet scan (reserved) | `true` |
 | `DISCOVERY_CLIENT_INTERFACES_WHITELIST` | Comma-separated interface names | `eth0,wlan0` |
 | `DISCOVERY_CLIENT_INTERFACES_BLACKLIST` | Comma-separated interface names | `docker0,lo` |
+| `DISCOVERY_CLIENT_ENCRYPTION_ENABLED` or `DISCOVERY_ENCRYPTION_ENABLED` | Fernet discovery mode | `true` |
+| `DISCOVERY_CLIENT_SECRET_KEY` or `DISCOVERY_SECRET_KEY` | Fernet key (must match server) | (key from `Fernet.generate_key()`) |
 
 Example with overrides:
 
@@ -148,6 +152,40 @@ servers = discover(config=config)
 ```
 
 Interface filtering: `ClientConfig(interfaces_whitelist=["eth0"], interfaces_blacklist=["docker0"])`. Names are case-sensitive and exact.
+
+---
+
+## Optional encrypted discovery (Fernet)
+
+When the server has **`DISCOVERY_ENCRYPTION_ENABLED = True`**, the client must send **Fernet-encrypted** discovery payloads and decrypt **Fernet-encrypted** responses. This hides discovery traffic on the LAN from parties without the key. It does **not** replace TLS for your app: use **HTTPS / WSS** for real application traffic.
+
+**Dependency:** install or upgrade **cryptography** (it is a declared dependency of this package):
+
+```bash
+pip install "cryptography>=42.0.0"
+```
+
+**Generate a Fernet key** (same key as on the server; never commit it):
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+**Environment variables** (or pass `ClientConfig(encryption_enabled=True, secret_key="...")`):
+
+| Variable | Purpose |
+|----------|---------|
+| `DISCOVERY_CLIENT_ENCRYPTION_ENABLED` or `DISCOVERY_ENCRYPTION_ENABLED` | Enable Fernet mode (`true` / `1` / `yes` / `on`) |
+| `DISCOVERY_CLIENT_SECRET_KEY` or `DISCOVERY_SECRET_KEY` | Same Fernet key string as server `DISCOVERY_SECRET_KEY` |
+
+**Django management command:**
+
+```bash
+export DISCOVERY_CLIENT_SECRET_KEY="<your-fernet-key>"
+python manage.py discover_servers --encryption
+```
+
+The command sets `encryption_enabled`; the secret must come from the environment (or use `load_config()` / `ClientConfig` in code).
 
 ---
 
@@ -193,6 +231,7 @@ Levels: **DEBUG** (socket/interface detail), **INFO** (discovery start/stop, ser
 ## Requirements
 
 - Python &gt;= 3.8
+- **cryptography** (Fernet), required for the installable package (encrypted and plain discovery).
 - **Optional**: `netifaces>=0.11.0` or `ifaddr>=0.2.0` for multi-interface discovery — install with `pip install django-udp-discovery-client[network]`.
 - **Optional**: `Django>=3.2` for the management command — install with `pip install django-udp-discovery-client[django]`.
 

@@ -17,6 +17,7 @@ django_udp_discovery/
 ├── __init__.py      # Package initialization and public API exports
 ├── apps.py          # Django app configuration with auto-startup
 ├── conf.py          # Configuration management with Django settings integration
+├── crypto.py        # Fernet key resolution and encrypt/decrypt helpers
 ├── listener.py      # UDP listener service implementation
 ├── utility.py       # Common utility functions used across modules
 ├── README.md        # Package documentation
@@ -54,12 +55,14 @@ Configuration management module that provides a unified interface for UDP discov
 - `DISCOVERY_TIMEOUT` - Client timeout in seconds (default: 0.5)
 - `DISCOVERY_BUFFER_SIZE` - UDP buffer size in bytes (default: 1024)
 - `ENABLE_LOGGING` - Enable/disable logging (default: True)
+- `DISCOVERY_ENCRYPTION_ENABLED` - Encrypt discovery UDP with Fernet (default: False)
+- `DISCOVERY_SECRET_KEY` - Fernet key (also read from `DISCOVERY_SECRET_KEY` env when unset on Django settings); see root **README.md** for setup and security notes
 
 ### `listener.py`
 Core UDP listener implementation that provides:
 - Threaded UDP socket listener running in background
 - Automatic server IP detection (uses `utility.get_server_ip()`)
-- Protocol message validation and response handling
+- Protocol message validation and response handling (plain or Fernet when `DISCOVERY_ENCRYPTION_ENABLED` is True)
 - Thread-safe service lifecycle management
 - Graceful shutdown capabilities
 - Comprehensive error handling

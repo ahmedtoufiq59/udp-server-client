@@ -10,6 +10,7 @@ A Django application that provides UDP-based service discovery functionality, al
 - **Configurable**: All settings can be customized via Django settings
 - **Production Ready**: Comprehensive error handling and graceful shutdown
 - **Well Tested**: Full test coverage with isolated test cases
+- **Optional encrypted discovery**: Fernet-based UDP payloads when `DISCOVERY_ENCRYPTION_ENABLED` is `True` (same pre-shared key on client and server)
 
 ## Platform Support
 
@@ -88,6 +89,31 @@ DISCOVERY_BUFFER_SIZE = 1024       # UDP buffer size in bytes (default: 1024)
 ENABLE_LOGGING = True              # Enable logging (default: True)
 ```
 
+### Optional encrypted discovery (Fernet)
+
+UDP discovery messages and responses are **plain text by default**. You can enable **Fernet symmetric encryption** so only holders of the same pre-shared key can discover the server. This protects the *discovery handshake only*; your application’s HTTP/WebSocket traffic must still use **HTTPS / WSS** (or equivalent) for confidentiality and integrity in production.
+
+**Dependency:** `cryptography` is required and is installed with this package (`pip install django-udp-discovery` pulls it in). To install or upgrade it explicitly:
+
+```bash
+pip install "cryptography>=42.0.0"
+```
+
+**Generate a Fernet key** (run once per environment; store the value in a secret manager or environment variable, never in source control):
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+**Django settings** (or environment variable `DISCOVERY_SECRET_KEY` if the setting is not defined on `django.conf.settings`):
+
+```python
+DISCOVERY_ENCRYPTION_ENABLED = True
+DISCOVERY_SECRET_KEY = "<paste Fernet key from command above>"
+```
+
+The listener decrypts each datagram with your key; only payloads that decrypt exactly to `DISCOVERY_MESSAGE` get a reply. Replies are **encrypted** with the same key. Clients must use the same key and enable encryption (see the **django-udp-discovery-client** README).
+
 ### Debugging and Console Logging
 
 To enable debugging and see detailed information in the console about the UDP discovery service, you **must** add the following logging configuration to your Django project's `settings.py`:
@@ -144,14 +170,15 @@ This configuration will output debug information to the console, including:
 
 The discovery protocol is simple:
 
-- **Discovery Message**: Client sends `DISCOVER_SERVER` (configurable) as a UDP message
-- **Response Format**: Server responds with `SERVER_IP:<ip_address>` (configurable prefix)
+- **Discovery Message**: Client sends `DISCOVER_SERVER` (configurable) as a UDP message, **or** a Fernet token whose plaintext is that message when `DISCOVERY_ENCRYPTION_ENABLED` is `True`.
+- **Response Format**: Server responds with `SERVER_IP:<ip_address>` (configurable prefix), **or** a Fernet token of that payload when encryption is enabled.
 - **Port**: Default 9999 (configurable)
 
 ## Requirements
 
 - Python 3.7+
 - Django 3.4+ (or Django 2.2+ with app config)
+- **cryptography** (Fernet), declared as a dependency for optional encrypted discovery
 
 ## Testing
 
@@ -163,11 +190,7 @@ python manage.py test django_udp_discovery
 
 ### Test Results
 
-Latest test results are available in the [test_results](test_results/README.md) directory. All 21 tests pass successfully, covering:
-
-- Configuration management (4 tests)
-- UDP listener service lifecycle (6 tests)
-- Management command functionality (11 tests)
+Latest test results are available in the [test_results](test_results/README.md) directory. The suite includes configuration tests, UDP listener lifecycle and protocol tests (plain and Fernet-encrypted discovery), and management command tests.
 
 See [test_results/README.md](test_results/README.md) for detailed test results and coverage information.
 

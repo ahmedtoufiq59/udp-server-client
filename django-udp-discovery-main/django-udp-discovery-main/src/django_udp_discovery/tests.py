@@ -311,6 +311,9 @@ class UdpListenerTest(TestCase):
     def test_responds_to_discovery_message(self) -> None:
         """
         Verify that the listener responds correctly to valid discovery messages.
+
+        Backward compatibility (6): with ``DISCOVERY_ENCRYPTION_ENABLED`` False
+        (default), plain UDP request bytes and plain text responses are unchanged.
         
         This test validates the core discovery protocol functionality:
             - The listener receives UDP messages
@@ -388,7 +391,14 @@ class UdpListenerTest(TestCase):
             stop_udp_service()
 
     def test_encrypted_discovery_roundtrip(self) -> None:
-        """Valid Fernet-wrapped discovery request yields encrypted response."""
+        """
+        End-to-end encrypted discovery (1)(2)(4)(5):
+
+        1. Client-style encrypted request: ``encrypt(DISCOVERY_MESSAGE)``.
+        2. Server decrypts and accepts when plaintext matches ``DISCOVERY_MESSAGE``.
+        4. Server sends encrypted ``RESPONSE_PREFIX`` + IP.
+        5. Client-style decrypt of response yields plaintext ``SERVER_IP:...``.
+        """
         key = Fernet.generate_key().decode("ascii")
         with override_settings(
             DISCOVERY_PORT=9991,
@@ -419,7 +429,7 @@ class UdpListenerTest(TestCase):
             self.assertFalse(is_running())
 
     def test_encrypted_mode_ignores_plaintext_discovery(self) -> None:
-        """When encryption is on, raw discovery bytes are not accepted."""
+        """When encryption is on, raw discovery bytes are not accepted (invalid packet)."""
         key = Fernet.generate_key().decode("ascii")
         with override_settings(
             DISCOVERY_PORT=9990,
@@ -491,6 +501,63 @@ class UdpListenerTest(TestCase):
             start_udp_service()
             time.sleep(0.45)
             self.assertFalse(is_running())
+
+    def test_encrypted_listener_ignores_token_encrypted_with_wrong_key(self) -> None:
+        """
+        Invalid encrypted packet (3): Fernet token produced with a different key
+        cannot be decrypted by the server; no response is sent.
+        """
+        server_key = Fernet.generate_key().decode("ascii")
+        wrong_key = Fernet.generate_key().decode("ascii")
+        with override_settings(
+            DISCOVERY_PORT=9970,
+            DISCOVERY_MESSAGE="DISCOVER_SERVER",
+            DISCOVERY_ENCRYPTION_ENABLED=True,
+            DISCOVERY_SECRET_KEY=server_key,
+            ENABLE_LOGGING=False,
+        ):
+            start_udp_service()
+            time.sleep(0.35)
+            self.assertTrue(is_running())
+            try:
+                wrong_f = Fernet(wrong_key.encode("ascii"))
+                token = wrong_f.encrypt(b"DISCOVER_SERVER")
+                client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                client_socket.settimeout(0.5)
+                client_socket.sendto(token, ("127.0.0.1", 9970))
+                with self.assertRaises(socket.timeout):
+                    client_socket.recvfrom(4096)
+                client_socket.close()
+            finally:
+                stop_udp_service()
+
+    def test_encrypted_listener_ignores_valid_fernet_with_wrong_plaintext(self) -> None:
+        """
+        Invalid encrypted packet (3): decrypt succeeds but plaintext must equal
+        ``DISCOVERY_MESSAGE`` exactly; otherwise the listener ignores the datagram.
+        """
+        key = Fernet.generate_key().decode("ascii")
+        with override_settings(
+            DISCOVERY_PORT=9971,
+            DISCOVERY_MESSAGE="DISCOVER_SERVER",
+            DISCOVERY_ENCRYPTION_ENABLED=True,
+            DISCOVERY_SECRET_KEY=key,
+            ENABLE_LOGGING=False,
+        ):
+            start_udp_service()
+            time.sleep(0.35)
+            self.assertTrue(is_running())
+            try:
+                f = Fernet(key.encode("ascii"))
+                token = f.encrypt(b"NOT_THE_DISCOVERY_MESSAGE")
+                client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                client_socket.settimeout(0.5)
+                client_socket.sendto(token, ("127.0.0.1", 9971))
+                with self.assertRaises(socket.timeout):
+                    client_socket.recvfrom(4096)
+                client_socket.close()
+            finally:
+                stop_udp_service()
 
     @override_settings(DISCOVERY_PORT=9993, ENABLE_LOGGING=False)
     def test_graceful_shutdown(self) -> None:

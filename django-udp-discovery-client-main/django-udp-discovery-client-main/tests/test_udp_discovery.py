@@ -161,7 +161,7 @@ class TestSendDiscoveryRequest:
 
 
 class TestOutgoingDiscoveryPayload:
-    """Fernet-wrapped outbound payload when encryption is enabled."""
+    """(1) Encrypted request generation: wire payload is Fernet(discovery_message)."""
 
     def test_plain_config_sends_raw_message_bytes(self):
         cfg = ClientConfig()
@@ -177,9 +177,10 @@ class TestOutgoingDiscoveryPayload:
 
 
 class TestReceiveResponsesEncrypted:
-    """receive_responses with ClientConfig.encryption_enabled."""
+    """receive_responses with ClientConfig.encryption_enabled (decrypt then parse)."""
 
     def test_receive_encrypted_valid_responses(self):
+        """(5) Valid Fernet-wrapped SERVER_IP responses decrypt and parse to DiscoveryResult."""
         key = Fernet.generate_key().decode("ascii")
         config = ClientConfig(encryption_enabled=True, secret_key=key)
         f = Fernet(key.encode("ascii"))
@@ -495,3 +496,49 @@ class TestIntegration:
         
         # Verify socket was closed
         mock_sock.close.assert_called_once()
+
+
+class TestFernetDiscoveryProtocolChecklist:
+    """
+    Encrypted discovery checklist (with server UDP tests in django-udp-discovery):
+
+    1. Encrypted request generation on the wire (Fernet of ``discovery_message``).
+    5. Client decrypts valid encrypted responses before parsing.
+    6. Plain mode: same bytes on the wire as before encryption existed.
+    """
+
+    @patch("discovery_client.network.socket.receive_responses")
+    @patch("discovery_client.network.socket.send_discovery_request")
+    @patch("discovery_client.network.socket.create_discovery_socket")
+    def test_single_broadcast_sends_encrypted_discovery_payload(
+        self, mock_create, mock_send, mock_recv
+    ) -> None:
+        mock_sock = MagicMock()
+        mock_create.return_value = mock_sock
+        mock_recv.return_value = []
+        key = Fernet.generate_key().decode("ascii")
+        config = ClientConfig(
+            encryption_enabled=True,
+            secret_key=key,
+            discovery_message=b"DISCOVER_SERVER",
+            discovery_port=9123,
+            timeout=3.0,
+        )
+        discover_servers_single_broadcast(config, broadcast_address="10.0.0.255")
+        mock_send.assert_called_once()
+        assert mock_send.call_args.kwargs.get("redact_payload") is True
+        sent = mock_send.call_args.args[1]
+        assert sent != b"DISCOVER_SERVER"
+        assert Fernet(key.encode("ascii")).decrypt(sent) == b"DISCOVER_SERVER"
+
+    def test_plain_mode_receive_backward_compatible_raw_response(self) -> None:
+        mock_sock = MagicMock()
+        wire = b"SERVER_IP:192.168.55.55"
+        mock_sock.recvfrom.side_effect = [
+            (wire, ("192.168.55.55", 12345)),
+            socket.timeout,
+        ]
+        config = ClientConfig(encryption_enabled=False)
+        results = receive_responses(mock_sock, config)
+        assert len(results) == 1
+        assert results[0].raw_response == wire
