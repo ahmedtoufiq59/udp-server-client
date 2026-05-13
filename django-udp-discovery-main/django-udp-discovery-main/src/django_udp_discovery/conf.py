@@ -16,6 +16,12 @@ Available Settings:
     DISCOVERY_TIMEOUT (float): Timeout in seconds for client discovery (default: 0.5).
     DISCOVERY_BUFFER_SIZE (int): UDP buffer size in bytes (default: 1024).
     ENABLE_LOGGING (bool): Enable/disable logging for discovery service (default: True).
+    DISCOVERY_SECRET_KEY (str): Optional Fernet key for encrypted discovery (default: "").
+        If empty, ``django_udp_discovery.crypto`` falls back to the ``DISCOVERY_SECRET_KEY``
+        environment variable. Use a key from ``Fernet.generate_key()``; never commit real keys.
+    DISCOVERY_ENCRYPTION_ENABLED (bool): When True, discovery requests and responses use
+        Fernet (see ``django_udp_discovery.crypto``). Requires a valid ``DISCOVERY_SECRET_KEY``.
+        Default: False (plain UDP, backward compatible).
 
 Usage:
     Access settings directly as attributes:
@@ -66,6 +72,8 @@ class _DiscoverySettings:
         "DISCOVERY_TIMEOUT": 0.5,
         "DISCOVERY_BUFFER_SIZE": 1024,   # bytes
         "ENABLE_LOGGING": True,
+        "DISCOVERY_SECRET_KEY": "",
+        "DISCOVERY_ENCRYPTION_ENABLED": False,
     }
 
     def __getattr__(self, name: str) -> Union[int, str, float, bool]:

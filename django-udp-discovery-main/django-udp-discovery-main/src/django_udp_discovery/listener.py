@@ -8,8 +8,10 @@ concurrently with Django without blocking the main application.
 
 The listener implements a simple discovery protocol:
     1. Listens for UDP messages on the configured port
-    2. Validates incoming messages against the configured discovery message
+    2. Validates incoming messages against the configured discovery message (plain bytes,
+       or Fernet-decrypted plaintext when ``DISCOVERY_ENCRYPTION_ENABLED`` is True)
     3. Responds with the server's IP address when a valid discovery request is received
+       (plain or Fernet-encrypted response to match the mode)
     4. Ignores messages that don't match the discovery protocol
 
 The service is thread-safe and provides graceful shutdown capabilities. It
@@ -43,9 +45,14 @@ Error Handling:
 import socket
 import threading
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 
 from django_udp_discovery.conf import settings
+from django_udp_discovery.crypto import (
+    build_fernet_from_settings,
+    decrypt_bytes,
+    encrypt_bytes,
+)
 from django_udp_discovery.utility import get_server_ip
 
 logger = logging.getLogger(__name__)
@@ -123,20 +130,91 @@ def _udp_listener_worker() -> None:
         discovery_message: bytes = settings.DISCOVERY_MESSAGE.encode('utf-8')
         response_prefix: bytes = settings.RESPONSE_PREFIX.encode('utf-8')
         buffer_size: int = settings.DISCOVERY_BUFFER_SIZE
-        
+
+        encryption_enabled: bool = bool(settings.DISCOVERY_ENCRYPTION_ENABLED)
+        fernet = None
+        if encryption_enabled:
+            if settings.ENABLE_LOGGING:
+                logger.info("UDP Discovery: encryption enabled (Fernet)")
+            try:
+                fernet = build_fernet_from_settings()
+            except ValueError:
+                logger.error(
+                    "UDP Discovery: DISCOVERY_SECRET_KEY is set but invalid; "
+                    "cannot start encrypted listener."
+                )
+                return
+            if fernet is None:
+                logger.error(
+                    "UDP Discovery: DISCOVERY_ENCRYPTION_ENABLED is True but no "
+                    "valid DISCOVERY_SECRET_KEY is configured."
+                )
+                return
+
         while _running:
             try:
                 # Receive data from client
                 data, client_address = _udp_socket.recvfrom(buffer_size)
-                
-                # Check if the message matches the discovery message
+
+                if encryption_enabled:
+                    plaintext = decrypt_bytes(data, fernet)
+                    if plaintext is None:
+                        if settings.ENABLE_LOGGING:
+                            logger.debug(
+                                "UDP Discovery: Ignoring undecryptable packet from %s:%s",
+                                client_address[0],
+                                client_address[1],
+                            )
+                        continue
+                    if plaintext != discovery_message:
+                        if settings.ENABLE_LOGGING:
+                            logger.debug(
+                                "UDP Discovery: Ignoring decrypted payload that does not "
+                                "match discovery message from %s:%s",
+                                client_address[0],
+                                client_address[1],
+                            )
+                        continue
+
+                    response_plain: bytes = response_prefix + server_ip.encode("utf-8")
+                    try:
+                        outgoing = encrypt_bytes(response_plain, fernet)
+                    except Exception as exc:
+                        if _running:
+                            logger.error(
+                                "UDP Discovery: Failed to encrypt response: %s",
+                                exc,
+                                exc_info=True,
+                            )
+                        continue
+
+                    try:
+                        _udp_socket.sendto(outgoing, client_address)
+                    except OSError as send_err:
+                        if _running:
+                            logger.error(
+                                "UDP Discovery: Failed to send encrypted response: %s",
+                                send_err,
+                            )
+                        continue
+
+                    if settings.ENABLE_LOGGING:
+                        logger.debug(
+                            "UDP Discovery: Sent encrypted response to %s:%s (server IP: %s)",
+                            client_address[0],
+                            client_address[1],
+                            server_ip,
+                        )
+                    continue
+
+                # Plain UDP discovery (backward compatible when encryption is disabled)
                 if data == discovery_message:
                     # Prepare response with server IP
                     response: bytes = response_prefix + server_ip.encode('utf-8')
-                    
+
                     # Send response back to the client
                     _udp_socket.sendto(response, client_address)
-                    
+
                     if settings.ENABLE_LOGGING:
                         logger.debug(
                             f"UDP Discovery: Responded to {client_address[0]}:{client_address[1]} "

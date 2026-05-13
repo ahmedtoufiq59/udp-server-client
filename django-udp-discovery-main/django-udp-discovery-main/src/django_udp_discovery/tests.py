@@ -15,15 +15,18 @@ Test Classes:
     StartDiscoveryCommandTest: Tests for the start_discovery management command.
 """
 
+import os
 import socket
 import time
 import threading
 from io import StringIO
 from unittest.mock import patch, MagicMock
-from django.test import TestCase, override_settings
+from cryptography.fernet import Fernet
+from django.test import TestCase, SimpleTestCase, override_settings
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django_udp_discovery.conf import settings as discovery_settings
+from django_udp_discovery import crypto as discovery_crypto
 from django_udp_discovery.listener import (
     start_udp_service,
     stop_udp_service,
@@ -57,6 +60,8 @@ class DiscoverySettingsTest(TestCase):
         self.assertEqual(discovery_settings.DISCOVERY_MESSAGE, "DISCOVER_SERVER")
         self.assertEqual(discovery_settings.RESPONSE_PREFIX, "SERVER_IP:")
         self.assertEqual(discovery_settings.DISCOVERY_TIMEOUT, 0.5)
+        self.assertEqual(discovery_settings.DISCOVERY_SECRET_KEY, "")
+        self.assertFalse(discovery_settings.DISCOVERY_ENCRYPTION_ENABLED)
 
     @override_settings(DISCOVERY_PORT=7777, DISCOVERY_MESSAGE="HELLO_SERVER")
     def test_overrides_from_django_settings(self) -> None:
@@ -94,6 +99,100 @@ class DiscoverySettingsTest(TestCase):
 
         fallback = discovery_settings.get("NON_EXISTENT", default="X")
         self.assertEqual(fallback, "X")
+
+
+class DiscoveryCryptoUtilityTest(SimpleTestCase):
+    """Tests for Fernet key resolution, validation, and safe decrypt (no UDP)."""
+
+    def test_validate_fernet_key_accepts_generated_key(self) -> None:
+        key = Fernet.generate_key()
+        out = discovery_crypto.validate_fernet_key(key)
+        self.assertEqual(out, key)
+        out_str = discovery_crypto.validate_fernet_key(key.decode("ascii"))
+        self.assertEqual(out_str, key)
+
+    def test_validate_fernet_key_rejects_empty(self) -> None:
+        with self.assertRaises(ValueError):
+            discovery_crypto.validate_fernet_key("")
+        with self.assertRaises(ValueError):
+            discovery_crypto.validate_fernet_key(b"")
+
+    def test_validate_fernet_key_rejects_garbage(self) -> None:
+        with self.assertRaises(ValueError):
+            discovery_crypto.validate_fernet_key("not-a-fernet-key")
+
+    def test_validate_fernet_key_rejects_wrong_type(self) -> None:
+        with self.assertRaises(TypeError):
+            discovery_crypto.validate_fernet_key(123)  # type: ignore[arg-type]
+
+    def test_encrypt_decrypt_roundtrip(self) -> None:
+        f = Fernet(Fernet.generate_key())
+        token = discovery_crypto.encrypt_bytes(b"hello", f)
+        plain = discovery_crypto.decrypt_bytes(token, f)
+        self.assertEqual(plain, b"hello")
+
+    def test_decrypt_bytes_invalid_token_returns_none(self) -> None:
+        a = Fernet(Fernet.generate_key())
+        b = Fernet(Fernet.generate_key())
+        token = discovery_crypto.encrypt_bytes(b"secret", a)
+        self.assertIsNone(discovery_crypto.decrypt_bytes(token, b))
+
+    def test_decrypt_bytes_garbage_returns_none(self) -> None:
+        f = Fernet(Fernet.generate_key())
+        self.assertIsNone(discovery_crypto.decrypt_bytes(b"not-a-token", f))
+
+    @override_settings(DISCOVERY_SECRET_KEY="")
+    def test_resolve_empty_django_explicit_skips_env(self) -> None:
+        env_key = Fernet.generate_key().decode("ascii")
+        with patch.dict(os.environ, {"DISCOVERY_SECRET_KEY": env_key}, clear=False):
+            resolved = discovery_crypto.resolve_discovery_secret_key_string()
+        self.assertEqual(resolved, "")
+
+    def test_resolve_prefers_django_over_env(self) -> None:
+        django_key = Fernet.generate_key().decode("ascii")
+        env_key = Fernet.generate_key().decode("ascii")
+        with self.settings(DISCOVERY_SECRET_KEY=django_key):
+            with patch.dict(os.environ, {"DISCOVERY_SECRET_KEY": env_key}, clear=False):
+                resolved = discovery_crypto.resolve_discovery_secret_key_string()
+        self.assertEqual(resolved, django_key)
+
+    def test_build_fernet_from_settings_none_when_unset(self) -> None:
+        with self.settings(DISCOVERY_SECRET_KEY=""):
+            self.assertIsNone(discovery_crypto.build_fernet_from_settings())
+
+    def test_resolve_uses_env_when_not_on_django_settings(self) -> None:
+        key = Fernet.generate_key().decode("ascii")
+
+        class _NoDiscoverySecret:
+            pass
+
+        fake = _NoDiscoverySecret()
+        with patch("django_udp_discovery.crypto.django_settings", fake):
+            with patch.dict(os.environ, {"DISCOVERY_SECRET_KEY": key}, clear=False):
+                self.assertEqual(discovery_crypto.resolve_discovery_secret_key_string(), key)
+
+    def test_build_fernet_from_settings_with_env_only(self) -> None:
+        key = Fernet.generate_key().decode("ascii")
+
+        class _NoDiscoverySecret:
+            pass
+
+        fake = _NoDiscoverySecret()
+        with patch("django_udp_discovery.crypto.django_settings", fake):
+            with patch.dict(os.environ, {"DISCOVERY_SECRET_KEY": key}, clear=False):
+                f = discovery_crypto.build_fernet_from_settings()
+        self.assertIsNotNone(f)
+        self.assertEqual(
+            discovery_crypto.decrypt_bytes(discovery_crypto.encrypt_bytes(b"ping", f), f),
+            b"ping",
+        )
+
+    def test_get_validated_key_bytes_invalid_raises_without_echoing_secret(self) -> None:
+        bad = "not-a-valid-fernet-key!!!!"
+        with self.settings(DISCOVERY_SECRET_KEY=bad):
+            with self.assertRaises(ValueError) as ctx:
+                discovery_crypto.get_validated_key_bytes_from_settings()
+        self.assertNotIn(bad, str(ctx.exception))
 
 
 class UdpListenerTest(TestCase):
@@ -287,6 +386,111 @@ class UdpListenerTest(TestCase):
             client_socket.close()
         finally:
             stop_udp_service()
+
+    def test_encrypted_discovery_roundtrip(self) -> None:
+        """Valid Fernet-wrapped discovery request yields encrypted response."""
+        key = Fernet.generate_key().decode("ascii")
+        with override_settings(
+            DISCOVERY_PORT=9991,
+            DISCOVERY_MESSAGE="DISCOVER_SERVER",
+            RESPONSE_PREFIX="SERVER_IP:",
+            DISCOVERY_ENCRYPTION_ENABLED=True,
+            DISCOVERY_SECRET_KEY=key,
+            ENABLE_LOGGING=False,
+        ):
+            start_udp_service()
+            time.sleep(0.35)
+            self.assertTrue(is_running())
+            try:
+                f = Fernet(key.encode("ascii"))
+                token = discovery_crypto.encrypt_bytes(b"DISCOVER_SERVER", f)
+                client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                client_socket.settimeout(2.0)
+                client_socket.sendto(token, ("127.0.0.1", 9991))
+                response, _addr = client_socket.recvfrom(4096)
+                client_socket.close()
+                plain = discovery_crypto.decrypt_bytes(response, f)
+                self.assertIsNotNone(plain)
+                assert plain is not None
+                self.assertTrue(plain.startswith(b"SERVER_IP:"))
+            finally:
+                stop_udp_service()
+            time.sleep(0.15)
+            self.assertFalse(is_running())
+
+    def test_encrypted_mode_ignores_plaintext_discovery(self) -> None:
+        """When encryption is on, raw discovery bytes are not accepted."""
+        key = Fernet.generate_key().decode("ascii")
+        with override_settings(
+            DISCOVERY_PORT=9990,
+            DISCOVERY_MESSAGE="DISCOVER_SERVER",
+            DISCOVERY_ENCRYPTION_ENABLED=True,
+            DISCOVERY_SECRET_KEY=key,
+            ENABLE_LOGGING=False,
+        ):
+            start_udp_service()
+            time.sleep(0.35)
+            self.assertTrue(is_running())
+            try:
+                client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                client_socket.settimeout(0.5)
+                client_socket.sendto(b"DISCOVER_SERVER", ("127.0.0.1", 9990))
+                with self.assertRaises(socket.timeout):
+                    client_socket.recvfrom(4096)
+                client_socket.close()
+            finally:
+                stop_udp_service()
+
+    def test_encrypted_mode_ignores_garbage_without_crash(self) -> None:
+        """Malformed UDP payloads are ignored while the listener keeps running."""
+        key = Fernet.generate_key().decode("ascii")
+        with override_settings(
+            DISCOVERY_PORT=9989,
+            DISCOVERY_MESSAGE="DISCOVER_SERVER",
+            DISCOVERY_ENCRYPTION_ENABLED=True,
+            DISCOVERY_SECRET_KEY=key,
+            ENABLE_LOGGING=False,
+        ):
+            start_udp_service()
+            time.sleep(0.35)
+            self.assertTrue(is_running())
+            try:
+                client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                client_socket.settimeout(0.3)
+                for _ in range(5):
+                    client_socket.sendto(b"\xffnot-fernet\x00", ("127.0.0.1", 9989))
+                self.assertTrue(is_running())
+                client_socket.close()
+            finally:
+                stop_udp_service()
+
+    def test_encryption_enabled_without_secret_stops_listener(self) -> None:
+        """Encrypted mode requires a key; misconfiguration exits the worker."""
+        env_backup = os.environ.pop("DISCOVERY_SECRET_KEY", None)
+        try:
+            with override_settings(
+                DISCOVERY_PORT=9988,
+                DISCOVERY_ENCRYPTION_ENABLED=True,
+                DISCOVERY_SECRET_KEY="",
+                ENABLE_LOGGING=False,
+            ):
+                start_udp_service()
+                time.sleep(0.45)
+                self.assertFalse(is_running())
+        finally:
+            if env_backup is not None:
+                os.environ["DISCOVERY_SECRET_KEY"] = env_backup
+
+    def test_encryption_enabled_with_invalid_secret_stops_listener(self) -> None:
+        with override_settings(
+            DISCOVERY_PORT=9987,
+            DISCOVERY_ENCRYPTION_ENABLED=True,
+            DISCOVERY_SECRET_KEY="not-a-valid-fernet-key",
+            ENABLE_LOGGING=False,
+        ):
+            start_udp_service()
+            time.sleep(0.45)
+            self.assertFalse(is_running())
 
     @override_settings(DISCOVERY_PORT=9993, ENABLE_LOGGING=False)
     def test_graceful_shutdown(self) -> None:
