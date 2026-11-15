@@ -122,11 +122,13 @@ def _udp_listener_worker() -> None:
             # Handle "Address already in use" error using utility function
             from django_udp_discovery.utility import is_port_error
             if is_port_error(e):
+                # Expected when another process already serves discovery (e.g. a
+                # second web worker); log one line instead of a traceback.
                 logger.error(
                     f"UDP Discovery: Port {port} is already in use. "
                     "Please check if another instance is running or change DISCOVERY_PORT."
                 )
-                raise
+                return
             raise
         
         # Set socket to non-blocking mode for graceful shutdown

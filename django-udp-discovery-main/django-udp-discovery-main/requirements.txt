@@ -1,0 +1,4 @@
+# Runtime dependencies of django-udp-discovery (kept in sync with pyproject.toml).
+# To work on the package itself, prefer: pip install -e ".[dev]"
+Django>=2.2
+cryptography>=42.0.0

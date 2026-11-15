@@ -21,6 +21,7 @@ Test Classes:
 import base64
 import os
 import socket
+import sys
 import time
 import threading
 from io import StringIO
@@ -893,8 +894,12 @@ class KeyRotationTest(TestCase):
             )
 
     def test_previous_keys_from_env(self) -> None:
-        with patch.dict(os.environ, {"DISCOVERY_PREVIOUS_SECRET_KEYS": self.old}):
-            self.assertEqual(discovery_crypto.resolve_previous_secret_keys(), [self.old])
+        class _NoPreviousKeys:
+            pass
+
+        with patch("django_udp_discovery.crypto.django_settings", _NoPreviousKeys()):
+            with patch.dict(os.environ, {"DISCOVERY_PREVIOUS_SECRET_KEYS": self.old}):
+                self.assertEqual(discovery_crypto.resolve_previous_secret_keys(), [self.old])
 
     def test_keyring_from_settings(self) -> None:
         with override_settings(
@@ -958,6 +963,55 @@ class KeyRotationTest(TestCase):
                 time.sleep(0.45)
                 self.assertFalse(is_running())
                 stop_udp_service()
+
+
+class AutostartDecisionTest(SimpleTestCase):
+    """should_autostart(): which processes start the listener on Django load."""
+
+    def _check(self, argv, environ=None):
+        from django_udp_discovery.apps import should_autostart
+
+        with patch.dict(sys.modules):
+            sys.modules.pop("pytest", None)
+            return should_autostart(argv=argv, environ=environ or {})
+
+    def test_runserver_reloader_parent_does_not_start(self) -> None:
+        self.assertFalse(self._check(["manage.py", "runserver"]))
+
+    def test_runserver_serving_child_starts(self) -> None:
+        self.assertTrue(self._check(["manage.py", "runserver"], {"RUN_MAIN": "true"}))
+
+    def test_runserver_noreload_starts(self) -> None:
+        self.assertTrue(self._check(["/srv/app/manage.py", "runserver", "--noreload"]))
+
+    def test_other_commands_do_not_start(self) -> None:
+        for argv in (
+            ["manage.py", "migrate"],
+            ["manage.py", "shell"],
+            ["manage.py", "start_discovery"],
+            ["/venv/bin/django-admin", "check"],
+            ["/usr/lib/python3/site-packages/django/__main__.py", "migrate"],
+            ["manage.py"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertFalse(self._check(argv, {"RUN_MAIN": "true"}))
+
+    def test_test_command_does_not_start(self) -> None:
+        self.assertFalse(self._check(["manage.py", "test"], {"RUN_MAIN": "true"}))
+
+    def test_wsgi_asgi_servers_start(self) -> None:
+        for argv in (["/venv/bin/gunicorn", "proj.wsgi"], ["uvicorn", "proj.asgi:app"]):
+            with self.subTest(argv=argv):
+                self.assertTrue(self._check(argv))
+
+    @override_settings(DISCOVERY_AUTOSTART=False)
+    def test_setting_disables_autostart(self) -> None:
+        self.assertFalse(self._check(["/venv/bin/gunicorn", "proj.wsgi"]))
+        self.assertFalse(self._check(["manage.py", "runserver", "--noreload"]))
+
+    @override_settings(TESTING=True)
+    def test_testing_setting_disables_autostart(self) -> None:
+        self.assertFalse(self._check(["/venv/bin/gunicorn", "proj.wsgi"]))
 
 
 class StartDiscoveryCommandTest(TestCase):

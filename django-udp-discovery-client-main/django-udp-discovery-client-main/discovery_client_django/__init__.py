@@ -8,4 +8,4 @@ This is an optional integration - the core discovery_client package does not
 require Django and can be used as a standalone Python library.
 """
 
-__version__ = "0.0.0"
+__version__ = "1.1.0"

@@ -436,6 +436,9 @@ class Command(BaseCommand):
         self.stdout.write(f'  Response Prefix: "{settings.RESPONSE_PREFIX}"')
         self.stdout.write(f'  Buffer Size: {settings.DISCOVERY_BUFFER_SIZE} bytes')
         self.stdout.write(f'  Logging: {"Enabled" if settings.ENABLE_LOGGING else "Disabled"}')
+        self.stdout.write(
+            f'  Encryption: {"Enabled (Fernet)" if settings.DISCOVERY_ENCRYPTION_ENABLED else "Disabled (plain UDP)"}'
+        )
 
     def _display_status(self) -> None:
         """
@@ -468,11 +471,18 @@ class Command(BaseCommand):
             )
             self.stdout.write('')
             self.stdout.write('To test the service, you can:')
-            self.stdout.write(
-                f'  1. Send UDP message "{settings.DISCOVERY_MESSAGE}" to port {settings.DISCOVERY_PORT}'
-            )
-            self.stdout.write('  2. Use the test_client.py script from test_project')
-            self.stdout.write('  3. Use: python manage.py test_discovery (if available)')
+            if settings.DISCOVERY_ENCRYPTION_ENABLED:
+                self.stdout.write(
+                    '  1. Run "python manage.py discover_servers --encryption" from '
+                    'django-udp-discovery-client with the same key'
+                )
+            else:
+                self.stdout.write(
+                    f'  1. Send UDP message "{settings.DISCOVERY_MESSAGE}" to port {settings.DISCOVERY_PORT}'
+                )
+                self.stdout.write(
+                    '  2. Run "python manage.py discover_servers" from django-udp-discovery-client'
+                )
         else:
             self.stdout.write(
                 self.style.ERROR('  Status: Not running')

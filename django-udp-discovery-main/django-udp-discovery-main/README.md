@@ -87,7 +87,10 @@ RESPONSE_PREFIX = "SERVER_IP:"     # Response prefix (default: "SERVER_IP:")
 DISCOVERY_TIMEOUT = 0.5            # Client timeout in seconds (default: 0.5)
 DISCOVERY_BUFFER_SIZE = 1024       # UDP buffer size in bytes (default: 1024)
 ENABLE_LOGGING = True              # Enable logging (default: True)
+DISCOVERY_AUTOSTART = True         # Start the listener when Django loads (default: True)
 ```
+
+**When the listener starts by itself:** with `DISCOVERY_AUTOSTART = True`, it starts in `runserver`'s serving process (not the auto-reloader's watcher process) and in web servers such as gunicorn, uvicorn or daphne. Other `manage.py` commands (`migrate`, `shell`, `test`, ...) never start it, so they don't compete with a running server for the port. If you run several worker processes, the first one to bind the port answers discovery; the rest log one "port already in use" line and carry on. Set `DISCOVERY_AUTOSTART = False` to start it yourself with `start_discovery` or `start_udp_service()`.
 
 ### Optional encrypted discovery (Fernet)
 
@@ -220,6 +223,10 @@ The discovery protocol is simple:
   - Response plaintext: `SERVER_IP:<ip_address>|<nonce>`, echoing the request's nonce. If the request had no nonce, the response has none.
   - Requests that are too old, replayed, tampered with, or encrypted with an unknown key get no reply.
 - **Port**: Default 9999 (configurable)
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Requirements
 

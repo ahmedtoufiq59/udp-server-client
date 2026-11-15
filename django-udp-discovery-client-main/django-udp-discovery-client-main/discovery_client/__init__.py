@@ -5,7 +5,7 @@ Public API: discover(), discover_one(), ClientConfig, load_config(), DiscoveryRe
 Use discover() or discover_one() to find servers on the local network; configure
 via ClientConfig or load_config() (env: DISCOVERY_CLIENT_*).
 """
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import logging
 from discovery_client.config import ClientConfig, load_config

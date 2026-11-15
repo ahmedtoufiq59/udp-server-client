@@ -28,7 +28,7 @@ Attributes:
     default_app_config (str): Django app configuration class path for Django < 3.2.
 """
 
-__version__: str = "1.0.0"
+__version__: str = "1.1.0"
 default_app_config: str = "django_udp_discovery.apps.UdpDiscoveryConfig"
 
 # Export main functions

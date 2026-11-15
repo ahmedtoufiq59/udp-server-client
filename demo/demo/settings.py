@@ -126,11 +126,18 @@ MAILERS = {
     },
 }
 
+# --- UDP discovery demo -------------------------------------------------------
+import importlib.util
 import os
+
+from django.core.exceptions import ImproperlyConfigured
 
 INSTALLED_APPS += [
     "django_udp_discovery",
 ]
+# Also expose the client's `discover_servers` command when that package is installed.
+if importlib.util.find_spec("discovery_client_django") is not None:
+    INSTALLED_APPS += ["discovery_client_django"]
 
 DISCOVERY_PORT = 9999
 DISCOVERY_MESSAGE = "DISCOVER_SERVER"
@@ -138,5 +145,19 @@ RESPONSE_PREFIX = "SERVER_IP:"
 DISCOVERY_BUFFER_SIZE = 1024
 ENABLE_LOGGING = True
 
-DISCOVERY_ENCRYPTION_ENABLED = True
-DISCOVERY_SECRET_KEY = os.environ["DISCOVERY_SECRET_KEY"]
+# Encrypted discovery is on by default in this demo. Set
+# DISCOVERY_ENCRYPTION_ENABLED=false in the environment to run it in plain mode.
+DISCOVERY_ENCRYPTION_ENABLED = os.environ.get(
+    "DISCOVERY_ENCRYPTION_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Never commit a real key: it comes from the environment.
+DISCOVERY_SECRET_KEY = os.environ.get("DISCOVERY_SECRET_KEY", "").strip()
+if DISCOVERY_ENCRYPTION_ENABLED and not DISCOVERY_SECRET_KEY:
+    raise ImproperlyConfigured(
+        "The demo has encrypted discovery enabled but DISCOVERY_SECRET_KEY is not set.\n"
+        "Generate a key and export it, for example:\n"
+        '  export DISCOVERY_SECRET_KEY="$(python -c \'from cryptography.fernet import Fernet; '
+        "print(Fernet.generate_key().decode())')\"\n"
+        "or run the demo in plain mode with DISCOVERY_ENCRYPTION_ENABLED=false."
+    )
