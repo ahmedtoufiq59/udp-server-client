@@ -3,6 +3,7 @@ Tests for UDP broadcast discovery functionality.
 
 Tests the discover() and discover_one() functions with mocked sockets.
 """
+import re
 import pytest
 import socket
 from cryptography.fernet import Fernet
@@ -325,8 +326,8 @@ class TestDiscoverServersSingleBroadcast:
             DEFAULT_BROADCAST_ADDRESS,
             redact_payload=False,
         )
-        # max_responses is optional and defaults to None
-        mock_receive.assert_called_once_with(mock_sock, config)
+        # max_responses is optional and defaults to None; plain mode sends no nonce
+        mock_receive.assert_called_once_with(mock_sock, config, expected_nonce=None)
         mock_sock.close.assert_called_once()
         
         assert len(results) == 1
@@ -529,7 +530,13 @@ class TestFernetDiscoveryProtocolChecklist:
         assert mock_send.call_args.kwargs.get("redact_payload") is True
         sent = mock_send.call_args.args[1]
         assert sent != b"DISCOVER_SERVER"
-        assert Fernet(key.encode("ascii")).decrypt(sent) == b"DISCOVER_SERVER"
+        plain = Fernet(key.encode("ascii")).decrypt(sent)
+        message, sep, nonce = plain.partition(b"|")
+        assert message == b"DISCOVER_SERVER"
+        assert sep == b"|"
+        assert re.fullmatch(rb"[0-9a-f]{32}", nonce)
+        # The same nonce must be required of responses.
+        assert mock_recv.call_args.kwargs["expected_nonce"] == nonce
 
     def test_plain_mode_receive_backward_compatible_raw_response(self) -> None:
         mock_sock = MagicMock()

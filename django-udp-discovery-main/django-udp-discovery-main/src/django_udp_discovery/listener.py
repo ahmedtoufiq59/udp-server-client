@@ -12,6 +12,11 @@ The listener implements a simple discovery protocol:
        or Fernet-decrypted plaintext when ``DISCOVERY_ENCRYPTION_ENABLED`` is True)
     3. Responds with the server's IP address when a valid discovery request is received
        (plain or Fernet-encrypted response to match the mode)
+
+    In encrypted mode, request tokens older than ``DISCOVERY_ENCRYPTION_TTL`` (plus
+    ``DISCOVERY_ENCRYPTION_CLOCK_SKEW``) are dropped, each token is answered at most
+    once (replay cache), and a client nonce sent as ``DISCOVERY_MESSAGE|<nonce>`` is
+    echoed back inside the encrypted response as ``RESPONSE_PREFIX<ip>|<nonce>``.
     4. Ignores messages that don't match the discovery protocol
 
 The service is thread-safe and provides graceful shutdown capabilities. It
@@ -49,9 +54,13 @@ from typing import Optional
 
 from django_udp_discovery.conf import settings
 from django_udp_discovery.crypto import (
+    NONCE_SEPARATOR,
+    ReplayCache,
     build_fernet_from_settings,
     decrypt_bytes,
     encrypt_bytes,
+    parse_discovery_request,
+    token_fingerprint,
 )
 from django_udp_discovery.utility import get_server_ip
 
@@ -133,6 +142,9 @@ def _udp_listener_worker() -> None:
 
         encryption_enabled: bool = bool(settings.DISCOVERY_ENCRYPTION_ENABLED)
         fernet = None
+        replay_cache: Optional[ReplayCache] = None
+        token_ttl: float = 0.0
+        clock_skew: float = 0.0
         if encryption_enabled:
             if settings.ENABLE_LOGGING:
                 logger.info("UDP Discovery: encryption enabled (Fernet)")
@@ -150,6 +162,24 @@ def _udp_listener_worker() -> None:
                     "valid DISCOVERY_SECRET_KEY is configured."
                 )
                 return
+            try:
+                token_ttl = float(settings.DISCOVERY_ENCRYPTION_TTL)
+                clock_skew = float(settings.DISCOVERY_ENCRYPTION_CLOCK_SKEW)
+                cache_size = int(settings.DISCOVERY_REPLAY_CACHE_SIZE)
+                if token_ttl <= 0 or clock_skew < 0 or cache_size <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                logger.error(
+                    "UDP Discovery: DISCOVERY_ENCRYPTION_TTL must be > 0, "
+                    "DISCOVERY_ENCRYPTION_CLOCK_SKEW >= 0 and DISCOVERY_REPLAY_CACHE_SIZE > 0; "
+                    "cannot start encrypted listener."
+                )
+                return
+            # A token stamped clock_skew in the future stays acceptable until
+            # ttl + 2 * clock_skew from now, so remember it at least that long.
+            replay_cache = ReplayCache(
+                ttl=token_ttl + 2 * clock_skew, max_entries=cache_size
+            )
 
         while _running:
             try:
@@ -157,16 +187,22 @@ def _udp_listener_worker() -> None:
                 data, client_address = _udp_socket.recvfrom(buffer_size)
 
                 if encryption_enabled:
-                    plaintext = decrypt_bytes(data, fernet)
+                    plaintext = decrypt_bytes(
+                        data, fernet, ttl=token_ttl, clock_skew=clock_skew
+                    )
                     if plaintext is None:
                         if settings.ENABLE_LOGGING:
                             logger.debug(
-                                "UDP Discovery: Ignoring undecryptable packet from %s:%s",
+                                "UDP Discovery: Ignoring invalid or expired encrypted "
+                                "packet from %s:%s",
                                 client_address[0],
                                 client_address[1],
                             )
                         continue
-                    if plaintext != discovery_message:
+                    is_request, nonce = parse_discovery_request(
+                        plaintext, discovery_message
+                    )
+                    if not is_request:
                         if settings.ENABLE_LOGGING:
                             logger.debug(
                                 "UDP Discovery: Ignoring decrypted payload that does not "
@@ -175,8 +211,19 @@ def _udp_listener_worker() -> None:
                                 client_address[1],
                             )
                         continue
+                    fingerprint = token_fingerprint(data)
+                    if fingerprint is None or not replay_cache.check_and_add(fingerprint):
+                        if settings.ENABLE_LOGGING:
+                            logger.debug(
+                                "UDP Discovery: Ignoring replayed encrypted request from %s:%s",
+                                client_address[0],
+                                client_address[1],
+                            )
+                        continue
 
                     response_plain: bytes = response_prefix + server_ip.encode("utf-8")
+                    if nonce is not None:
+                        response_plain += NONCE_SEPARATOR + nonce
                     try:
                         outgoing = encrypt_bytes(response_plain, fernet)
                     except Exception as exc:

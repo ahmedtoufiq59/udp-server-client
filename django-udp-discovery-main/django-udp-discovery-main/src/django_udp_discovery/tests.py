@@ -12,9 +12,12 @@ interference from concurrent test execution.
 Test Classes:
     DiscoverySettingsTest: Tests for configuration module functionality.
     UdpListenerTest: Tests for UDP listener service lifecycle and behavior.
+    DiscoveryCryptoHardeningTest: Token TTL, tamper detection, replay cache, request parsing.
+    EncryptedListenerHardeningTest: Listener nonce echo, replay, expiry and tamper handling.
     StartDiscoveryCommandTest: Tests for the start_discovery management command.
 """
 
+import base64
 import os
 import socket
 import time
@@ -584,6 +587,258 @@ class UdpListenerTest(TestCase):
         
         # Verify it's stopped
         self.assertFalse(is_running())
+
+
+def _flip_bit(token: bytes, byte_index: int, bit: int = 0) -> bytes:
+    """Flip one bit in the decoded bytes of a Fernet token and re-encode it."""
+    raw = bytearray(base64.urlsafe_b64decode(token))
+    raw[byte_index] ^= 1 << bit
+    return base64.urlsafe_b64encode(bytes(raw))
+
+
+class DiscoveryCryptoHardeningTest(SimpleTestCase):
+    """TTL, tamper detection, replay cache and request parsing (no UDP)."""
+
+    def setUp(self) -> None:
+        self.fernet = Fernet(Fernet.generate_key())
+
+    def test_defaults(self) -> None:
+        self.assertEqual(discovery_crypto.DEFAULT_TOKEN_TTL, 30.0)
+        self.assertEqual(discovery_crypto.DEFAULT_CLOCK_SKEW, 10.0)
+        self.assertEqual(discovery_settings.DISCOVERY_ENCRYPTION_TTL, 30.0)
+        self.assertEqual(discovery_settings.DISCOVERY_ENCRYPTION_CLOCK_SKEW, 10.0)
+        self.assertEqual(discovery_settings.DISCOVERY_REPLAY_CACHE_SIZE, 10000)
+
+    def test_expired_token_rejected(self) -> None:
+        now = 1_700_000_000
+        token = self.fernet.encrypt_at_time(b"x", now - 41)
+        self.assertIsNone(
+            discovery_crypto.decrypt_bytes(token, self.fernet, ttl=30, clock_skew=10, now=now)
+        )
+
+    def test_token_within_ttl_plus_skew_accepted(self) -> None:
+        now = 1_700_000_000
+        token = self.fernet.encrypt_at_time(b"x", now - 39)
+        self.assertEqual(
+            discovery_crypto.decrypt_bytes(token, self.fernet, ttl=30, clock_skew=10, now=now),
+            b"x",
+        )
+
+    def test_future_token_skew_bounds(self) -> None:
+        now = 1_700_000_000
+        ok = self.fernet.encrypt_at_time(b"x", now + 10)
+        too_far = self.fernet.encrypt_at_time(b"x", now + 11)
+        self.assertEqual(
+            discovery_crypto.decrypt_bytes(ok, self.fernet, ttl=30, clock_skew=10, now=now),
+            b"x",
+        )
+        self.assertIsNone(
+            discovery_crypto.decrypt_bytes(too_far, self.fernet, ttl=30, clock_skew=10, now=now)
+        )
+
+    def test_default_ttl_enforced(self) -> None:
+        old = self.fernet.encrypt_at_time(b"x", int(time.time()) - 300)
+        self.assertIsNone(discovery_crypto.decrypt_bytes(old, self.fernet))
+        self.assertEqual(discovery_crypto.decrypt_bytes(old, self.fernet, ttl=None), b"x")
+
+    def test_bit_flipped_real_token_rejected(self) -> None:
+        token = self.fernet.encrypt(b"DISCOVER_SERVER|" + b"a" * 32)
+        raw_len = len(base64.urlsafe_b64decode(token))
+        # version, timestamp, IV, ciphertext and HMAC regions
+        for index in (0, 1, 8, 9, 24, 30, raw_len - 1):
+            with self.subTest(byte=index):
+                tampered = _flip_bit(token, index)
+                self.assertNotEqual(tampered, token)
+                self.assertIsNone(discovery_crypto.decrypt_bytes(tampered, self.fernet))
+                self.assertIsNone(
+                    discovery_crypto.decrypt_bytes(tampered, self.fernet, ttl=None)
+                )
+
+    def test_replay_cache_detects_repeat_and_expires(self) -> None:
+        cache = discovery_crypto.ReplayCache(ttl=50)
+        fp = b"a" * 32
+        self.assertTrue(cache.check_and_add(fp, now=100.0))
+        self.assertFalse(cache.check_and_add(fp, now=149.0))
+        # After the window the entry is pruned and the fingerprint is new again.
+        self.assertTrue(cache.check_and_add(fp, now=151.0))
+
+    def test_replay_cache_is_size_bounded(self) -> None:
+        cache = discovery_crypto.ReplayCache(ttl=1000, max_entries=3)
+        for i in range(5):
+            self.assertTrue(cache.check_and_add(bytes([i]), now=1.0))
+        self.assertEqual(len(cache), 3)
+        self.assertFalse(cache.check_and_add(bytes([4]), now=2.0))
+
+    def test_replay_cache_rejects_bad_params(self) -> None:
+        with self.assertRaises(ValueError):
+            discovery_crypto.ReplayCache(ttl=0)
+        with self.assertRaises(ValueError):
+            discovery_crypto.ReplayCache(ttl=10, max_entries=0)
+
+    def test_fingerprint_ignores_base64_noise(self) -> None:
+        token = self.fernet.encrypt(b"x")
+        fp = discovery_crypto.token_fingerprint(token)
+        self.assertIsNotNone(fp)
+        # The base64 decoder skips characters outside the alphabet, so these
+        # decrypt to the same token and must map to the same fingerprint.
+        self.assertEqual(discovery_crypto.token_fingerprint(token + b"\n"), fp)
+        self.assertEqual(discovery_crypto.token_fingerprint(token + b"!!"), fp)
+
+    def test_parse_discovery_request(self) -> None:
+        msg = b"DISCOVER_SERVER"
+        nonce = b"0123456789abcdef0123456789abcdef"
+        self.assertEqual(discovery_crypto.parse_discovery_request(msg, msg), (True, None))
+        self.assertEqual(
+            discovery_crypto.parse_discovery_request(msg + b"|" + nonce, msg), (True, nonce)
+        )
+        for bad in (
+            b"DISCOVER_SERVERX",
+            msg + b"|",
+            msg + b"|short",
+            msg + b"|" + nonce.upper(),
+            msg + b"|" + nonce + b"|extra",
+            msg + b"|" + b"a" * 129,
+        ):
+            with self.subTest(bad=bad):
+                self.assertEqual(
+                    discovery_crypto.parse_discovery_request(bad, msg), (False, None)
+                )
+
+
+class EncryptedListenerHardeningTest(TestCase):
+    """UDP listener: nonce echo, replay rejection, expiry and tamper checks."""
+
+    NONCE = b"00112233445566778899aabbccddeeff"
+
+    def setUp(self) -> None:
+        if is_running():
+            stop_udp_service()
+        time.sleep(0.1)
+        self.key = Fernet.generate_key().decode("ascii")
+        self.fernet = Fernet(self.key.encode("ascii"))
+
+    def tearDown(self) -> None:
+        if is_running():
+            stop_udp_service()
+        time.sleep(0.1)
+
+    def _settings(self, port: int, **extra):
+        values = dict(
+            DISCOVERY_PORT=port,
+            DISCOVERY_MESSAGE="DISCOVER_SERVER",
+            RESPONSE_PREFIX="SERVER_IP:",
+            DISCOVERY_ENCRYPTION_ENABLED=True,
+            DISCOVERY_SECRET_KEY=self.key,
+            ENABLE_LOGGING=False,
+        )
+        values.update(extra)
+        return override_settings(**values)
+
+    def _start(self) -> None:
+        start_udp_service()
+        time.sleep(0.35)
+        self.assertTrue(is_running())
+
+    def _exchange(self, port: int, packet: bytes, timeout: float = 1.0):
+        """Send one packet; return the response bytes or None on timeout."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(packet, ("127.0.0.1", port))
+            try:
+                data, _ = sock.recvfrom(4096)
+                return data
+            except socket.timeout:
+                return None
+        finally:
+            sock.close()
+
+    def test_nonce_is_echoed_in_encrypted_response(self) -> None:
+        with self._settings(9960):
+            self._start()
+            token = self.fernet.encrypt(b"DISCOVER_SERVER|" + self.NONCE)
+            response = self._exchange(9960, token)
+            self.assertIsNotNone(response)
+            plain = discovery_crypto.decrypt_bytes(response, self.fernet)
+            self.assertIsNotNone(plain)
+            body, _, nonce = plain.rpartition(b"|")
+            self.assertTrue(body.startswith(b"SERVER_IP:"))
+            self.assertEqual(nonce, self.NONCE)
+
+    def test_legacy_request_without_nonce_gets_response_without_nonce(self) -> None:
+        with self._settings(9961):
+            self._start()
+            response = self._exchange(9961, self.fernet.encrypt(b"DISCOVER_SERVER"))
+            self.assertIsNotNone(response)
+            plain = discovery_crypto.decrypt_bytes(response, self.fernet)
+            self.assertTrue(plain.startswith(b"SERVER_IP:"))
+            self.assertNotIn(b"|", plain)
+
+    def test_replayed_request_is_ignored(self) -> None:
+        with self._settings(9962):
+            self._start()
+            token = self.fernet.encrypt(b"DISCOVER_SERVER|" + self.NONCE)
+            self.assertIsNotNone(self._exchange(9962, token))
+            self.assertIsNone(self._exchange(9962, token, timeout=0.5))
+            # Same token with base64 noise appended is still a replay.
+            self.assertIsNone(self._exchange(9962, token + b"\n", timeout=0.5))
+            # A fresh token for the same request is answered.
+            fresh = self.fernet.encrypt(b"DISCOVER_SERVER|" + self.NONCE)
+            self.assertIsNotNone(self._exchange(9962, fresh))
+            self.assertTrue(is_running())
+
+    def test_expired_request_is_ignored(self) -> None:
+        with self._settings(9963):
+            self._start()
+            old = self.fernet.encrypt_at_time(
+                b"DISCOVER_SERVER|" + self.NONCE, int(time.time()) - 60
+            )
+            self.assertIsNone(self._exchange(9963, old, timeout=0.5))
+
+    def test_ttl_setting_is_honoured(self) -> None:
+        with self._settings(9964, DISCOVERY_ENCRYPTION_TTL=120):
+            self._start()
+            aged = self.fernet.encrypt_at_time(
+                b"DISCOVER_SERVER|" + self.NONCE, int(time.time()) - 60
+            )
+            self.assertIsNotNone(self._exchange(9964, aged))
+
+    def test_future_request_beyond_skew_is_ignored(self) -> None:
+        with self._settings(9965, DISCOVERY_ENCRYPTION_CLOCK_SKEW=5):
+            self._start()
+            future = self.fernet.encrypt_at_time(
+                b"DISCOVER_SERVER|" + self.NONCE, int(time.time()) + 30
+            )
+            self.assertIsNone(self._exchange(9965, future, timeout=0.5))
+
+    def test_bit_flipped_request_is_ignored(self) -> None:
+        with self._settings(9966):
+            self._start()
+            token = self.fernet.encrypt(b"DISCOVER_SERVER|" + self.NONCE)
+            self.assertIsNone(self._exchange(9966, _flip_bit(token, 30), timeout=0.5))
+            # The listener is unaffected, and the untouched token still works.
+            self.assertIsNotNone(self._exchange(9966, token))
+
+    def test_invalid_ttl_setting_stops_listener(self) -> None:
+        for bad in ({"DISCOVERY_ENCRYPTION_TTL": 0},
+                    {"DISCOVERY_ENCRYPTION_CLOCK_SKEW": -1},
+                    {"DISCOVERY_REPLAY_CACHE_SIZE": 0},
+                    {"DISCOVERY_ENCRYPTION_TTL": "soon"}):
+            with self.subTest(setting=bad), self._settings(9967, **bad):
+                start_udp_service()
+                time.sleep(0.45)
+                self.assertFalse(is_running())
+                stop_udp_service()
+
+    def test_plain_mode_ignores_ttl_settings(self) -> None:
+        """Plain mode is unchanged: invalid encryption-only settings have no effect."""
+        with self._settings(
+            9968, DISCOVERY_ENCRYPTION_ENABLED=False, DISCOVERY_ENCRYPTION_TTL=0
+        ):
+            self._start()
+            self.assertEqual(
+                self._exchange(9968, b"DISCOVER_SERVER")[:10], b"SERVER_IP:"
+            )
 
 
 class StartDiscoveryCommandTest(TestCase):

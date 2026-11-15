@@ -22,6 +22,12 @@ Available Settings:
     DISCOVERY_ENCRYPTION_ENABLED (bool): When True, discovery requests and responses use
         Fernet (see ``django_udp_discovery.crypto``). Requires a valid ``DISCOVERY_SECRET_KEY``.
         Default: False (plain UDP, backward compatible).
+    DISCOVERY_ENCRYPTION_TTL (float): Encrypted mode only. Maximum age in seconds of an
+        accepted request token (default: 30). Older tokens are dropped.
+    DISCOVERY_ENCRYPTION_CLOCK_SKEW (float): Encrypted mode only. Seconds of clock
+        difference tolerated between client and server, in either direction (default: 10).
+    DISCOVERY_REPLAY_CACHE_SIZE (int): Encrypted mode only. Maximum number of recently
+        seen request tokens remembered for replay detection (default: 10000).
 
 Usage:
     Access settings directly as attributes:
@@ -74,6 +80,9 @@ class _DiscoverySettings:
         "ENABLE_LOGGING": True,
         "DISCOVERY_SECRET_KEY": "",
         "DISCOVERY_ENCRYPTION_ENABLED": False,
+        "DISCOVERY_ENCRYPTION_TTL": 30.0,
+        "DISCOVERY_ENCRYPTION_CLOCK_SKEW": 10.0,
+        "DISCOVERY_REPLAY_CACHE_SIZE": 10000,
     }
 
     def __getattr__(self, name: str) -> Union[int, str, float, bool]:

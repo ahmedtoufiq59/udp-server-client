@@ -11,7 +11,14 @@ import socket
 from typing import List, Tuple, Optional, Set
 from discovery_client.config import ClientConfig
 from discovery_client.results import DiscoveryResult
-from discovery_client.crypto_util import encrypt_payload, decrypt_payload
+from discovery_client.crypto_util import (
+    build_request_plaintext,
+    decrypt_payload,
+    encrypt_payload,
+    new_nonce,
+    nonce_matches,
+    split_response_nonce,
+)
 from discovery_client.network.interfaces import InterfaceInfo, select_interfaces
 from discovery_client.network.utils import broadcast_from_ip_and_mask
 
@@ -23,14 +30,27 @@ logger = logging.getLogger("django_udp_discovery_client")
 DEFAULT_BROADCAST_ADDRESS = "255.255.255.255"
 
 
-def _outgoing_discovery_payload(config: ClientConfig) -> bytes:
-    """Plain discovery message bytes, or Fernet-encrypted payload when enabled."""
+def _outgoing_discovery_payload(config: ClientConfig, nonce: Optional[bytes] = None) -> bytes:
+    """
+    Plain discovery message bytes, or Fernet-encrypted payload when enabled.
+
+    In encrypted mode, ``nonce`` (when given) is appended as ``<message>|<nonce>``
+    before encryption; the server echoes it back inside its encrypted response.
+    """
     if not config.encryption_enabled:
         return config.discovery_message
     fernet = getattr(config, "_fernet", None)
     if fernet is None:
         raise RuntimeError("ClientConfig encryption_enabled without Fernet instance")
-    return encrypt_payload(config.discovery_message, fernet)
+    plaintext = config.discovery_message
+    if nonce is not None:
+        plaintext = build_request_plaintext(plaintext, nonce)
+    return encrypt_payload(plaintext, fernet)
+
+
+def _new_request_nonce(config: ClientConfig) -> Optional[bytes]:
+    """A fresh nonce for an encrypted discovery round, or None in plain mode."""
+    return new_nonce() if config.encryption_enabled else None
 
 
 def parse_response(response: bytes, prefix: bytes) -> Optional[Tuple[str, int]]:
@@ -170,7 +190,8 @@ def send_discovery_request(
 def receive_responses(
     sock: socket.socket,
     config: ClientConfig,
-    max_responses: Optional[int] = None
+    max_responses: Optional[int] = None,
+    expected_nonce: Optional[bytes] = None,
 ) -> List[DiscoveryResult]:
     """
     Receive and parse discovery responses until timeout.
@@ -179,6 +200,9 @@ def receive_responses(
         sock: UDP socket with timeout set
         config: ClientConfig with response_prefix for parsing
         max_responses: Maximum number of responses to collect (None = unlimited)
+        expected_nonce: Encrypted mode only. The nonce sent with the request; responses
+            that do not echo it (missing or different) are dropped. The discovery
+            functions always pass one. When None, the nonce is not checked.
     
     Returns:
         List of DiscoveryResult objects for valid responses
@@ -186,8 +210,9 @@ def receive_responses(
     Note:
         This function will continue receiving until socket timeout.
         Invalid responses (wrong prefix) are ignored. When ``config.encryption_enabled``
-        is True, datagrams are decrypted with Fernet first; undecryptable packets are
-        ignored without raising.
+        is True, datagrams are decrypted with Fernet first; undecryptable, expired
+        (older than ``config.encryption_ttl`` plus ``config.encryption_clock_skew``)
+        or nonce-mismatched packets are ignored without raising.
     """
     results = []
     logger.debug("Starting to receive discovery responses")
@@ -208,10 +233,26 @@ def receive_responses(
                 if fernet is None:
                     logger.debug("Ignoring response: encryption enabled but Fernet is missing")
                     continue
-                payload = decrypt_payload(data, fernet)
+                payload = decrypt_payload(
+                    data,
+                    fernet,
+                    ttl=config.encryption_ttl,
+                    clock_skew=config.encryption_clock_skew,
+                )
                 if payload is None:
                     logger.debug(
-                        "Ignoring undecryptable discovery response from %s:%s",
+                        "Ignoring undecryptable or expired discovery response from %s:%s",
+                        addr[0],
+                        addr[1],
+                    )
+                    continue
+                payload, received_nonce = split_response_nonce(payload)
+                if expected_nonce is not None and not nonce_matches(
+                    received_nonce, expected_nonce
+                ):
+                    logger.debug(
+                        "Ignoring discovery response with missing or mismatched nonce "
+                        "from %s:%s",
                         addr[0],
                         addr[1],
                     )
@@ -315,18 +356,19 @@ def discover_servers_single_broadcast(
     try:
         # Create and configure socket
         sock = create_discovery_socket(config.timeout)
+        nonce = _new_request_nonce(config)
         
         # Send discovery request
         send_discovery_request(
             sock,
-            _outgoing_discovery_payload(config),
+            _outgoing_discovery_payload(config, nonce),
             config.discovery_port,
             broadcast_address,
             redact_payload=config.encryption_enabled,
         )
         
         # Receive responses
-        results = receive_responses(sock, config)
+        results = receive_responses(sock, config, expected_nonce=nonce)
         
         return results
         
@@ -627,6 +669,9 @@ def discover_servers_multi_interface(config: ClientConfig) -> List[DiscoveryResu
     try:
         # Create a single socket for receiving responses from all interfaces
         sock = create_discovery_socket(config.timeout)
+        # One nonce per discovery round; every interface's request carries it and
+        # each is encrypted separately, so each token is distinct.
+        nonce = _new_request_nonce(config)
         
         # Send discovery request to each interface's broadcast address
         successful_sends = 0
@@ -638,7 +683,7 @@ def discover_servers_multi_interface(config: ClientConfig) -> List[DiscoveryResu
                 # Send discovery request to this interface's broadcast
                 send_discovery_request(
                     sock,
-                    _outgoing_discovery_payload(config),
+                    _outgoing_discovery_payload(config, nonce),
                     config.discovery_port,
                     broadcast_addr,
                     redact_payload=config.encryption_enabled,
@@ -664,7 +709,7 @@ def discover_servers_multi_interface(config: ClientConfig) -> List[DiscoveryResu
         logger.info(f"Sent discovery requests on {successful_sends} interface(s)")
         
         # Receive responses from all interfaces
-        results = receive_responses(sock, config)
+        results = receive_responses(sock, config, expected_nonce=nonce)
         
         # Deduplicate results by (ip, port)
         unique_results = deduplicate_results(results)

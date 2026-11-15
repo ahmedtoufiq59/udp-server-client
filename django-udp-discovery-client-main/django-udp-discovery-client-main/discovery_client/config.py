@@ -53,6 +53,11 @@ class ClientConfig:
         secret_key: Fernet key (``Fernet.generate_key()`` string). Required when
             ``encryption_enabled`` is True. Env: ``DISCOVERY_CLIENT_SECRET_KEY`` or
             ``DISCOVERY_SECRET_KEY`` (fallback for parity with server env).
+        encryption_ttl: Encrypted mode only. Maximum age in seconds of an accepted
+            response token (default: 30). Env: ``DISCOVERY_CLIENT_ENCRYPTION_TTL``.
+        encryption_clock_skew: Encrypted mode only. Seconds of clock difference
+            tolerated between client and server in either direction (default: 10).
+            Env: ``DISCOVERY_CLIENT_ENCRYPTION_CLOCK_SKEW``.
     """
     discovery_port: int = 9999
     discovery_message: bytes = field(default_factory=lambda: b"DISCOVER_SERVER")
@@ -64,6 +69,8 @@ class ClientConfig:
     interfaces_blacklist: Optional[List[str]] = None
     encryption_enabled: bool = False
     secret_key: Optional[str] = None
+    encryption_ttl: float = 30.0
+    encryption_clock_skew: float = 10.0
     _fernet: Any = field(init=False, repr=False, compare=False, default=None)
     
     def __post_init__(self):
@@ -96,6 +103,16 @@ class ClientConfig:
         # Validate retries
         if self.retries < 0:
             raise ValueError(f"retries must be non-negative, got {self.retries}")
+
+        if self.encryption_ttl <= 0:
+            raise ValueError(
+                f"encryption_ttl must be positive, got {self.encryption_ttl}"
+            )
+        if self.encryption_clock_skew < 0:
+            raise ValueError(
+                "encryption_clock_skew must be non-negative, "
+                f"got {self.encryption_clock_skew}"
+            )
 
         if self.encryption_enabled:
             if not (self.secret_key and str(self.secret_key).strip()):
@@ -212,6 +229,22 @@ class ClientConfig:
                 sk = os.environ.get("DISCOVERY_SECRET_KEY")
             if sk:
                 config_dict['secret_key'] = sk.strip()
+
+        if 'encryption_ttl' not in overrides:
+            ttl = os.environ.get(f"{env_prefix}ENCRYPTION_TTL")
+            if ttl:
+                try:
+                    config_dict['encryption_ttl'] = float(ttl)
+                except ValueError:
+                    raise ValueError(f"Invalid {env_prefix}ENCRYPTION_TTL: {ttl}")
+
+        if 'encryption_clock_skew' not in overrides:
+            skew = os.environ.get(f"{env_prefix}ENCRYPTION_CLOCK_SKEW")
+            if skew:
+                try:
+                    config_dict['encryption_clock_skew'] = float(skew)
+                except ValueError:
+                    raise ValueError(f"Invalid {env_prefix}ENCRYPTION_CLOCK_SKEW: {skew}")
         
         # Merge env vars with overrides (overrides take precedence)
         config_dict.update(overrides)

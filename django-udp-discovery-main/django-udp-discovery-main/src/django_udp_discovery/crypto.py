@@ -10,11 +10,31 @@ for wire encryption; otherwise they are optional for callers or tests.
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import os
-from typing import Optional, Union
+import re
+import threading
+import time
+from collections import OrderedDict
+from typing import Optional, Tuple, Union
 
+# pyrefly: ignore [missing-import]
 from cryptography.fernet import Fernet, InvalidToken
+# pyrefly: ignore [missing-import]
 from django.conf import settings as django_settings
+
+#: Default maximum token age in seconds for encrypted discovery packets.
+DEFAULT_TOKEN_TTL: float = 30.0
+
+#: Default tolerance in seconds for clock differences between client and server.
+DEFAULT_CLOCK_SKEW: float = 10.0
+
+#: Separator between the discovery message (or response) and the client nonce.
+NONCE_SEPARATOR: bytes = b"|"
+
+_NONCE_RE = re.compile(rb"^[0-9a-f]{16,128}$")
 
 
 def resolve_discovery_secret_key_string() -> str:
@@ -94,21 +114,135 @@ def encrypt_bytes(plaintext: bytes, fernet: Fernet) -> bytes:
     return fernet.encrypt(plaintext)
 
 
-def decrypt_bytes(token: bytes, fernet: Fernet) -> Optional[bytes]:
+def decrypt_bytes(
+    token: bytes,
+    fernet: Fernet,
+    ttl: Optional[float] = DEFAULT_TOKEN_TTL,
+    clock_skew: float = DEFAULT_CLOCK_SKEW,
+    now: Optional[float] = None,
+) -> Optional[bytes]:
     """
-    Decrypt a Fernet token.
+    Decrypt a Fernet token, enforcing a maximum token age.
+
+    Args:
+        token: Fernet token bytes.
+        fernet: ``Fernet`` instance for the shared key.
+        ttl: Maximum token age in seconds. ``None`` disables the age check
+            (signature is still verified).
+        clock_skew: Seconds of clock difference tolerated in both directions:
+            tokens up to ``ttl + clock_skew`` seconds old are accepted, and tokens
+            stamped up to ``clock_skew`` seconds in the future are accepted.
+        now: Current Unix time (for tests); defaults to ``time.time()``.
 
     Returns:
-        Plaintext bytes on success, or ``None`` on
-        :class:`~cryptography.fernet.InvalidToken` (invalid or expired token).
+        Plaintext bytes on success, or ``None`` if the token is invalid, tampered
+        with, expired, or stamped too far in the future.
 
     Note:
         Does not log decrypted content or the secret key.
     """
     try:
+        if ttl is not None:
+            # extract_timestamp verifies the HMAC before trusting the timestamp.
+            issued_at = fernet.extract_timestamp(token)
+            current = time.time() if now is None else now
+            if current - issued_at > ttl + clock_skew:
+                return None
+            if issued_at - current > clock_skew:
+                return None
         return fernet.decrypt(token)
-    except InvalidToken:
+    except (InvalidToken, TypeError, ValueError):
         return None
+
+
+def token_fingerprint(token: bytes) -> Optional[bytes]:
+    """
+    Return a stable SHA-256 fingerprint of a Fernet token's decoded bytes.
+
+    Hashing the decoded bytes (not the base64 text) means re-encoded variants of
+    the same token, such as one with stray characters appended that the base64
+    decoder ignores, map to the same fingerprint.
+    """
+    try:
+        raw = base64.urlsafe_b64decode(token)
+    except (binascii.Error, ValueError, TypeError):
+        return None
+    return hashlib.sha256(raw).digest()
+
+
+class ReplayCache:
+    """
+    Time-limited, size-bounded set of recently seen token fingerprints.
+
+    Entries live for ``ttl`` seconds; a token presented again within that window
+    is reported as a replay. Use a lifetime of at least ``token_ttl + 2 * clock_skew``
+    so a token cannot outlive its cache entry while still passing the age check.
+    Thread-safe.
+    """
+
+    def __init__(self, ttl: float, max_entries: int = 10000) -> None:
+        if ttl <= 0:
+            raise ValueError("ReplayCache ttl must be positive.")
+        if max_entries <= 0:
+            raise ValueError("ReplayCache max_entries must be positive.")
+        self.ttl = float(ttl)
+        self.max_entries = int(max_entries)
+        self._entries: "OrderedDict[bytes, float]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def _prune(self, now: float) -> None:
+        while self._entries:
+            key, expires = next(iter(self._entries.items()))
+            if expires > now:
+                break
+            del self._entries[key]
+
+    def check_and_add(self, fingerprint: bytes, now: Optional[float] = None) -> bool:
+        """
+        Record ``fingerprint`` and report whether it is new.
+
+        Returns:
+            True if the fingerprint was not seen within the window (and is now
+            recorded); False if it is a replay.
+        """
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            self._prune(current)
+            if fingerprint in self._entries:
+                return False
+            if len(self._entries) >= self.max_entries:
+                # Evict the oldest entry; entries share one lifetime, so insertion
+                # order is expiry order.
+                self._entries.popitem(last=False)
+            self._entries[fingerprint] = current + self.ttl
+            return True
+
+
+def parse_discovery_request(
+    plaintext: bytes, discovery_message: bytes
+) -> Tuple[bool, Optional[bytes]]:
+    """
+    Parse a decrypted discovery request.
+
+    Accepted forms:
+        * ``DISCOVERY_MESSAGE`` (no nonce; older encrypted clients)
+        * ``DISCOVERY_MESSAGE|<nonce>`` where nonce is 16-128 lowercase hex chars
+
+    Returns:
+        ``(True, nonce_or_None)`` for a valid request, ``(False, None)`` otherwise.
+    """
+    if plaintext == discovery_message:
+        return True, None
+    head = discovery_message + NONCE_SEPARATOR
+    if plaintext.startswith(head):
+        nonce = plaintext[len(head):]
+        if _NONCE_RE.match(nonce):
+            return True, nonce
+    return False, None
 
 
 def get_validated_key_bytes_from_settings() -> Optional[bytes]:
