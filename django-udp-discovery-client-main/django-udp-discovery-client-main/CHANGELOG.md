@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Optional Fernet-encrypted discovery (`ClientConfig.encryption_enabled`, `secret_key`; env `DISCOVERY_CLIENT_ENCRYPTION_ENABLED` / `DISCOVERY_CLIENT_SECRET_KEY`, with `DISCOVERY_ENCRYPTION_ENABLED` / `DISCOVERY_SECRET_KEY` fallbacks; `discover_servers --encryption`).
+- Encrypted replies expire: `encryption_ttl` (default 30 s) and `encryption_clock_skew` (default 10 s), env `DISCOVERY_CLIENT_ENCRYPTION_TTL` / `DISCOVERY_CLIENT_ENCRYPTION_CLOCK_SKEW`.
+- Each encrypted discovery round sends a random nonce (`DISCOVER_SERVER|<nonce>`), and only replies echoing it are accepted. This blocks replayed replies.
+- Key rotation: `previous_secret_keys` (env `DISCOVERY_CLIENT_PREVIOUS_SECRET_KEYS` / `DISCOVERY_PREVIOUS_SECRET_KEYS`) are accepted for decryption; requests always use `secret_key`.
+
+### Changed
+
+- `secret_key` and `previous_secret_keys` are no longer shown in `repr(ClientConfig)`.
+- `receive_responses()` takes an optional `expected_nonce`.
+
+### Compatibility
+
+- Encrypted clients now require the server to echo the nonce, so they need a django-udp-discovery server with nonce support. Upgrade servers first, or together with clients. Plain mode is unchanged.
+
 ## [1.0.0] - 2025-02-15
 
 ### Changed
@@ -152,7 +170,7 @@ This is the first functional release. If you were using a previous development v
 
 ---
 
-## [Unreleased]
+## Roadmap
 
 ### Planned Features
 - Multicast discovery support

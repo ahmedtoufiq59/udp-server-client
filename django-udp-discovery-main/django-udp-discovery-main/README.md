@@ -10,7 +10,7 @@ A Django application that provides UDP-based service discovery functionality, al
 - **Configurable**: All settings can be customized via Django settings
 - **Production Ready**: Comprehensive error handling and graceful shutdown
 - **Well Tested**: Full test coverage with isolated test cases
-- **Optional encrypted discovery**: Fernet-based UDP payloads when `DISCOVERY_ENCRYPTION_ENABLED` is `True` (same pre-shared key on client and server)
+- **Optional encrypted discovery**: Fernet-based UDP payloads when `DISCOVERY_ENCRYPTION_ENABLED` is `True` (same pre-shared key on client and server), with token expiry, replay protection, request nonces and zero-downtime key rotation
 
 ## Platform Support
 
@@ -112,7 +112,50 @@ DISCOVERY_ENCRYPTION_ENABLED = True
 DISCOVERY_SECRET_KEY = "<paste Fernet key from command above>"
 ```
 
-The listener decrypts each datagram with your key; only payloads that decrypt exactly to `DISCOVERY_MESSAGE` get a reply. Replies are **encrypted** with the same key. Clients must use the same key and enable encryption (see the **django-udp-discovery-client** README).
+The listener decrypts each datagram with your key; only payloads that decrypt to `DISCOVERY_MESSAGE` (optionally followed by a client nonce, see [Protocol](#protocol)) get a reply. Replies are **encrypted** with the same key. Clients must use the same key and enable encryption (see the **django-udp-discovery-client** README).
+
+#### Replay and freshness protection
+
+In encrypted mode the listener also:
+
+- **Drops old packets.** A request is accepted only if its Fernet timestamp is at most `DISCOVERY_ENCRYPTION_TTL` seconds old. To allow for clocks that disagree a little, it also tolerates `DISCOVERY_ENCRYPTION_CLOCK_SKEW` seconds in either direction. With the defaults, a request may be up to 40 seconds old, or up to 10 seconds "in the future".
+- **Answers each request once.** It remembers recently seen requests (up to `DISCOVERY_REPLAY_CACHE_SIZE`) for as long as they could still pass the age check. A captured request that is sent again gets no reply.
+- **Echoes the client nonce.** Current clients add a random nonce to each request. The server copies it into the encrypted reply, so the client can tell the reply belongs to its own request and was not replayed from an earlier one.
+
+```python
+DISCOVERY_ENCRYPTION_TTL = 30          # seconds (default: 30)
+DISCOVERY_ENCRYPTION_CLOCK_SKEW = 10   # seconds (default: 10)
+DISCOVERY_REPLAY_CACHE_SIZE = 10000    # remembered requests (default: 10000)
+```
+
+Keep machine clocks roughly in sync (for example with NTP). If a node's clock is off by more than the skew allowance, its discovery packets are silently dropped. These settings have no effect in plain mode. If any of them is invalid (TTL not above 0, negative skew, cache size not above 0), the encrypted listener logs an error and does not start.
+
+#### Rotating the key
+
+You can change the key without a moment where servers and clients cannot find each other. List older keys in `DISCOVERY_PREVIOUS_SECRET_KEYS`. Incoming packets are accepted under the current key or any previous key; outgoing packets always use `DISCOVERY_SECRET_KEY`.
+
+```python
+DISCOVERY_SECRET_KEY = "<current key>"
+DISCOVERY_PREVIOUS_SECRET_KEYS = ["<older key>"]   # or a comma-separated string
+```
+
+If the setting is not defined, the `DISCOVERY_PREVIOUS_SECRET_KEYS` environment variable (comma-separated) is used instead.
+
+To rotate from key A to key B:
+
+1. **Add B everywhere.** On every server and client, keep A as the current key and add B as a previous key. Nothing changes on the wire yet.
+2. **Switch to B.** On every node, make B the current key and move A to the previous keys. Nodes you have not updated yet still interoperate, because every node accepts both keys.
+3. **Remove A.** Once every node uses B as its current key, delete A from the previous keys.
+
+Do not skip step 1. A node that only knows A cannot read replies from a node that has already switched to B.
+
+If a previous key is invalid, or previous keys are set without a current key, the encrypted listener logs an error and does not start. The error never includes key material.
+
+#### Compatibility
+
+- Plain mode (`DISCOVERY_ENCRYPTION_ENABLED = False`) is unchanged.
+- This server still answers older encrypted clients that send no nonce. Their replies carry no nonce either.
+- Current encrypted clients **require** the nonce in the reply, so they need a server with nonce support (this version or later). Upgrade servers before, or together with, clients.
 
 ### Debugging and Console Logging
 
@@ -170,8 +213,12 @@ This configuration will output debug information to the console, including:
 
 The discovery protocol is simple:
 
-- **Discovery Message**: Client sends `DISCOVER_SERVER` (configurable) as a UDP message, **or** a Fernet token whose plaintext is that message when `DISCOVERY_ENCRYPTION_ENABLED` is `True`.
-- **Response Format**: Server responds with `SERVER_IP:<ip_address>` (configurable prefix), **or** a Fernet token of that payload when encryption is enabled.
+- **Discovery Message**: Client sends `DISCOVER_SERVER` (configurable) as a UDP message.
+- **Response Format**: Server responds with `SERVER_IP:<ip_address>` (configurable prefix).
+- **Encrypted mode** (`DISCOVERY_ENCRYPTION_ENABLED = True`): both directions are Fernet tokens.
+  - Request plaintext: `DISCOVER_SERVER|<nonce>`, where the nonce is 16 to 128 lowercase hex characters (current clients send 32). A bare `DISCOVER_SERVER` is also accepted from older clients.
+  - Response plaintext: `SERVER_IP:<ip_address>|<nonce>`, echoing the request's nonce. If the request had no nonce, the response has none.
+  - Requests that are too old, replayed, tampered with, or encrypted with an unknown key get no reply.
 - **Port**: Default 9999 (configurable)
 
 ## Requirements
@@ -182,15 +229,17 @@ The discovery protocol is simple:
 
 ## Testing
 
-Run the test suite:
+Run the test suite from a Django project that has `django_udp_discovery` in `INSTALLED_APPS`:
 
 ```bash
 python manage.py test django_udp_discovery
 ```
 
+Use settings that leave `DISCOVERY_ENCRYPTION_ENABLED` off and do not set `DISCOVERY_SECRET_KEY` or `DISCOVERY_PREVIOUS_SECRET_KEYS`, in either Django settings or the environment. The tests switch encryption on per test; a project that enables it globally makes the plain-mode tests fail.
+
 ### Test Results
 
-Latest test results are available in the [test_results](test_results/README.md) directory. The suite includes configuration tests, UDP listener lifecycle and protocol tests (plain and Fernet-encrypted discovery), and management command tests.
+Latest test results are available in the [test_results](test_results/README.md) directory. The suite includes configuration tests, UDP listener lifecycle and protocol tests (plain and Fernet-encrypted discovery, including token expiry, tampering, replays, nonce echo and key rotation), and management command tests.
 
 See [test_results/README.md](test_results/README.md) for detailed test results and coverage information.
 

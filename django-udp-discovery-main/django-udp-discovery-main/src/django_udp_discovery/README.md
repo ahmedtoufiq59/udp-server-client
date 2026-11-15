@@ -17,7 +17,7 @@ django_udp_discovery/
 ├── __init__.py      # Package initialization and public API exports
 ├── apps.py          # Django app configuration with auto-startup
 ├── conf.py          # Configuration management with Django settings integration
-├── crypto.py        # Fernet key resolution and encrypt/decrypt helpers
+├── crypto.py        # Fernet keys, rotation keyring, TTL-checked decrypt, replay cache
 ├── listener.py      # UDP listener service implementation
 ├── utility.py       # Common utility functions used across modules
 ├── README.md        # Package documentation
@@ -57,12 +57,17 @@ Configuration management module that provides a unified interface for UDP discov
 - `ENABLE_LOGGING` - Enable/disable logging (default: True)
 - `DISCOVERY_ENCRYPTION_ENABLED` - Encrypt discovery UDP with Fernet (default: False)
 - `DISCOVERY_SECRET_KEY` - Fernet key (also read from `DISCOVERY_SECRET_KEY` env when unset on Django settings); see root **README.md** for setup and security notes
+- `DISCOVERY_PREVIOUS_SECRET_KEYS` - Older Fernet keys still accepted during key rotation (list, or comma-separated string; env fallback). Not set by default
+- `DISCOVERY_ENCRYPTION_TTL` - Encrypted mode: maximum request age in seconds (default: 30)
+- `DISCOVERY_ENCRYPTION_CLOCK_SKEW` - Encrypted mode: clock difference tolerated in either direction, in seconds (default: 10)
+- `DISCOVERY_REPLAY_CACHE_SIZE` - Encrypted mode: how many recent requests are remembered to reject replays (default: 10000)
 
 ### `listener.py`
 Core UDP listener implementation that provides:
 - Threaded UDP socket listener running in background
 - Automatic server IP detection (uses `utility.get_server_ip()`)
 - Protocol message validation and response handling (plain or Fernet when `DISCOVERY_ENCRYPTION_ENABLED` is True)
+- Encrypted mode: drops expired or replayed requests and echoes the client nonce in the reply
 - Thread-safe service lifecycle management
 - Graceful shutdown capabilities
 - Comprehensive error handling
@@ -260,25 +265,15 @@ The package includes comprehensive error handling:
 
 ## Testing
 
-The test suite is located in the root-level `tests/` directory (not included in the
-installable package). To run the tests:
+The tests live in `tests.py` inside this package. Run them from any Django project that has `django_udp_discovery` in `INSTALLED_APPS`:
 
 ```bash
-# From the project root
-python test_project/manage.py test django_udp_discovery
-
-# Or if installed
 python manage.py test django_udp_discovery
 ```
 
-The tests use isolated ports to prevent conflicts and include cleanup between test methods.
+Use settings that leave `DISCOVERY_ENCRYPTION_ENABLED` off and do not set `DISCOVERY_SECRET_KEY` or `DISCOVERY_PREVIOUS_SECRET_KEYS` (in settings or the environment). The tests turn encryption on per test, and a project that enables it globally makes the plain-mode tests fail.
 
-### Test Results
-
-Latest test results and coverage information are available in the [test_results](../../../../test_results/README.md) directory. All 21 tests pass successfully, covering:
-- Configuration management (4 tests)
-- UDP listener service lifecycle (6 tests)
-- Management command functionality (11 tests)
+The tests use isolated ports to prevent conflicts and include cleanup between test methods. They cover configuration, the listener lifecycle, plain and encrypted discovery (token expiry, tampering, replays, nonce echo, key rotation), and the management command.
 
 ## Production Usage Examples
 

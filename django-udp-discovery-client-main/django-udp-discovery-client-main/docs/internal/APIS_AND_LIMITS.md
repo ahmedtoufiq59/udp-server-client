@@ -39,13 +39,18 @@
 | `enable_subnet_scan` | bool | True | **Not used in discovery flow** (reserved). |
 | `interfaces_whitelist` | Optional[List[str]] | None | If set, only these interface names are used. |
 | `interfaces_blacklist` | Optional[List[str]] | None | If set, these interface names are excluded. |
+| `encryption_enabled` | bool | False | Fernet-encrypted discovery (must match server). |
+| `secret_key` | Optional[str] | None | Current Fernet key; required when encryption is on. Hidden from `repr`. |
+| `previous_secret_keys` | Optional[List[str]] | None | Older keys accepted for decryption during rotation. Hidden from `repr`. |
+| `encryption_ttl` | float | 30.0 | Max age (s) of an accepted encrypted reply. Must be > 0. |
+| `encryption_clock_skew` | float | 10.0 | Clock difference (s) tolerated in either direction. Must be >= 0. |
 
 **Methods**:
 
 - `ClientConfig.from_env(**overrides) -> ClientConfig` — Build from env vars; `**overrides` take precedence.
 
 **Environment variables** (prefix `DISCOVERY_CLIENT_`):  
-`PORT`, `MESSAGE`, `RESPONSE_PREFIX`, `TIMEOUT`, `RETRIES`, `ENABLE_SUBNET_SCAN`, `INTERFACES_WHITELIST`, `INTERFACES_BLACKLIST`.
+`PORT`, `MESSAGE`, `RESPONSE_PREFIX`, `TIMEOUT`, `RETRIES`, `ENABLE_SUBNET_SCAN`, `INTERFACES_WHITELIST`, `INTERFACES_BLACKLIST`, `ENCRYPTION_ENABLED`, `SECRET_KEY`, `PREVIOUS_SECRET_KEYS`, `ENCRYPTION_TTL`, `ENCRYPTION_CLOCK_SKEW`. `ENCRYPTION_ENABLED`, `SECRET_KEY` and `PREVIOUS_SECRET_KEYS` also fall back to the unprefixed server names (`DISCOVERY_ENCRYPTION_ENABLED`, etc.).
 
 ---
 
@@ -104,6 +109,8 @@
 
 - **IPv4 only**: Sockets use `AF_INET`; response parsing expects dotted-decimal IPv4; `InterfaceInfo` is IPv4. No IPv6.
 - **UDP broadcast only**: No multicast. Discovery sends to each interface's broadcast address (or `255.255.255.255` for single-broadcast path).
+- **Encrypted mode needs a nonce-aware server**: encrypted discovery requires the server to echo the request nonce; older encrypted servers are not discovered.
+- **Clock sync matters in encrypted mode**: replies older than `encryption_ttl + encryption_clock_skew` seconds, or stamped more than `encryption_clock_skew` seconds in the future, are dropped.
 - **No cross-subnet broadcast**: Broadcast is limited to the local broadcast domain (typically one subnet). Servers on other subnets/VLANs are not discovered unless they are in the same broadcast domain.
 
 ### 2.2 Segmented / corporate networks

@@ -114,7 +114,7 @@ The solution is split into two cooperating Python packages in this repository:
  └──────────────────────────┘                   └──────────────────────────┘
 
   Plain mode:     DISCOVER_SERVER  ──►  SERVER_IP:192.168.x.x[:port]
-  Encrypted mode: Fernet(DISCOVER_SERVER) ──► Fernet(SERVER_IP:...)
+  Encrypted mode: Fernet(DISCOVER_SERVER|nonce) ──► Fernet(SERVER_IP:...|nonce)
 ```
 
 ### 4.3 Phases of communication
@@ -152,27 +152,36 @@ Client                          Server (listener thread)
 Both sides share the same **`DISCOVERY_SECRET_KEY`** (Fernet key). Server has **`DISCOVERY_ENCRYPTION_ENABLED=True`**; client sets **`encryption_enabled=True`** (or env / `--encryption`).
 
 ```
-Client                          Server
-  |                                    |
-  |  Fernet.encrypt(b"DISCOVER_SERVER")|
-  |  ------------------------------->  |  decrypt_bytes()
-  |                                    |  InvalidToken -> ignore (no crash)
-  |                                    |  plaintext == DISCOVERY_MESSAGE ?
-  |                                    |  encrypt(SERVER_IP:<ip>)
-  |  <-------------------------------  |
-  |  Fernet token (ciphertext)         |
-  |                                    |
-  |  decrypt -> parse SERVER_IP:...    |
-  |  connect (prefer HTTPS/WSS next)   |
-  v                                    v
+Client                               Server
+  |                                         |
+  |  nonce = 32 random hex chars            |
+  |  Fernet.encrypt(b"DISCOVER_SERVER|" +   |
+  |                 nonce)                  |
+  |  ------------------------------------>  |  decrypt_bytes(ttl, clock_skew)
+  |                                         |  invalid / expired -> ignore
+  |                                         |  plaintext == DISCOVERY_MESSAGE[|nonce] ?
+  |                                         |  token seen before? -> ignore (replay)
+  |                                         |  encrypt(SERVER_IP:<ip>|nonce)
+  |  <------------------------------------  |
+  |  Fernet token (ciphertext)              |
+  |                                         |
+  |  decrypt (ttl, clock_skew)              |
+  |  nonce matches? else ignore             |
+  |  parse SERVER_IP:...                    |
+  |  connect (prefer HTTPS/WSS next)        |
+  v                                         v
 ```
 
 **Rejection rules in encrypted mode**
 
 - Plaintext `DISCOVER_SERVER` on the wire → **ignored** (no response).
 - Garbage UDP → **ignored**.
-- Fernet token with **wrong key** → **ignored**.
+- Fernet token with **wrong key** (not the current key or a listed previous key) → **ignored**.
 - Fernet token with **wrong inner message** → **ignored**.
+- Fernet token that has been **tampered with** (any bit changed) → **ignored**.
+- Token **older than the TTL** (default 30 s, plus 10 s clock-skew allowance), or stamped too far in the future → **ignored**, on both sides.
+- **Replayed request** (a token the server has already answered) → **ignored**.
+- **Reply without the client's nonce**, or with a different one (for example a reply recorded from an earlier round) → **ignored** by the client.
 
 ---
 
@@ -189,6 +198,7 @@ Client                          Server
 - **Server:** `DISCOVERY_SECRET_KEY` in Django `settings.py` or environment variable (see `django_udp_discovery.crypto.resolve_discovery_secret_key_string`).
 - **Client:** `DISCOVERY_CLIENT_SECRET_KEY` or `DISCOVERY_SECRET_KEY` (must match server).
 - **Never** commit production keys to Git; distribute via secure channel (USB policy file, lab image, secrets manager).
+- **Rotation without downtime:** both sides accept a list of previous keys (`DISCOVERY_PREVIOUS_SECRET_KEYS` on the server, `previous_secret_keys` / `DISCOVERY_CLIENT_PREVIOUS_SECRET_KEYS` on the client) for decryption, and always encrypt with the current key. To rotate from key A to key B: (1) add B as a previous key everywhere, (2) make B current everywhere and move A to previous, (3) remove A.
 
 ### 6.3 Threat model (honest scope)
 
@@ -197,13 +207,14 @@ Client                          Server
 | Discovery request/response content on the LAN from parties without the key | HTTP API bodies, cookies, sessions after connect |
 | Casual sniffing of “who is the teacher server?” in encrypted mode | Traffic on other subnets (broadcast does not cross routers) |
 | Accidental wrong-key clients (they get no usable reply) | Insider with the shared key (they can discover) |
+| Replaying captured requests or replies (TTL, server replay cache, client nonce) | Machines whose clocks drift beyond the skew allowance (their packets are dropped) |
 
 **After discovery**, use **HTTPS** and **WSS** for application data. UDP discovery does not replace TLS.
 
 ### 6.4 Safe failure behavior
 
 - **`InvalidToken`** and malformed packets: handled without terminating the listener thread.
-- Misconfiguration (encryption on, missing/invalid key): server listener **fails to start** with a logged error rather than falling back to silent insecure mode.
+- Misconfiguration (encryption on, missing/invalid key or previous key, or invalid TTL / skew / replay-cache settings): server listener **fails to start** with a logged error rather than falling back to silent insecure mode. Errors never include key material.
 
 ---
 
@@ -212,7 +223,7 @@ Client                          Server
 - **Zero-configuration discovery** — Sensible defaults; server auto-starts with Django.
 - **Offline LAN / intranet** — No cloud, no DNS required for discovery.
 - **Pure Python / Django integration** — Server is a Django app; client core has no Django dependency.
-- **Optional authenticated encrypted discovery** — Fernet when both sides enable it.
+- **Optional authenticated encrypted discovery** — Fernet when both sides enable it, with token expiry, replay protection, request nonces and zero-downtime key rotation.
 - **Backward compatibility** — Plain UDP unchanged when encryption flags are off.
 - **Multi-interface discovery (client)** — Broadcast per interface, deduplicate by `(ip, port)` with `[network]` extra (`netifaces` / `ifaddr`).
 - **Safe invalid packet handling** — Ignore bad decrypts and wrong messages; no listener crash.
@@ -242,6 +253,10 @@ RESPONSE_PREFIX = "SERVER_IP:"
 # Encrypted discovery (optional)
 DISCOVERY_ENCRYPTION_ENABLED = True
 DISCOVERY_SECRET_KEY = "<paste-fernet-key-here>"  # never commit real keys
+# DISCOVERY_PREVIOUS_SECRET_KEYS = ["<older-key>"]  # only while rotating
+# DISCOVERY_ENCRYPTION_TTL = 30          # seconds
+# DISCOVERY_ENCRYPTION_CLOCK_SKEW = 10   # seconds
+# DISCOVERY_REPLAY_CACHE_SIZE = 10000
 ```
 
 Environment alternative for the secret (when not set in Django settings): **`DISCOVERY_SECRET_KEY`**.
@@ -263,6 +278,9 @@ export DISCOVERY_ENCRYPTION_ENABLED=True
 # or: export DISCOVERY_CLIENT_ENCRYPTION_ENABLED=True
 export DISCOVERY_SECRET_KEY="<same-fernet-key-as-server>"
 # or: export DISCOVERY_CLIENT_SECRET_KEY="<same-fernet-key-as-server>"
+# export DISCOVERY_CLIENT_PREVIOUS_SECRET_KEYS="<older-key>"   # only while rotating
+# export DISCOVERY_CLIENT_ENCRYPTION_TTL=30
+# export DISCOVERY_CLIENT_ENCRYPTION_CLOCK_SKEW=10
 ```
 
 ```python
@@ -422,6 +440,8 @@ python -m pytest tests/ -q
 |------------|--------|
 | **Broadcast scope** | UDP broadcast typically reaches only the **same broadcast domain** (often one /24 subnet). Servers on other VLANs are not discovered without relays or scanning extensions. |
 | **IPv4 focus** | Discovery is designed around IPv4 LANs; no IPv6 discovery in current design. |
+| **Clock sync (encrypted mode)** | Packets are rejected if clocks differ by more than the skew allowance (default 10 s); keep nodes on NTP. |
+| **Version pairing (encrypted mode)** | Current encrypted clients require a server that echoes the request nonce; upgrade servers first. |
 | **Shared secret distribution** | Fernet mode requires **out-of-band** secure distribution of `DISCOVERY_SECRET_KEY`; it is not a public-key infrastructure. |
 | **Not full app security** | Discovery encryption does **not** secure HTTP APIs, admin panels, or websockets—use **HTTPS/WSS** after connect. |
 | **Firewall / AP isolation** | Client isolation on Wi‑Fi or strict UDP rules can block broadcast or replies. |
@@ -433,7 +453,6 @@ python -m pytest tests/ -q
 ## 13. Future Improvements
 
 - **First-class HTTPS/WSS documentation and helpers** — Post-discovery URL builder with TLS hints and certificate pinning options.
-- **Key rotation** — Support multiple valid Fernet keys during rotation windows.
 - **Public-key discovery** — Encrypt discovery with a server public key; students only need the public half.
 - **QR-based key sharing** — Display or scan lab session keys at room entry.
 - **Admin dashboard** — Live view of discovery requests, encryption mode, and connected subnets.

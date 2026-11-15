@@ -28,7 +28,7 @@ Pure Python client for discovering [django-udp-discovery](https://github.com/Ogr
 - **Django integration (optional)** — Management command `python manage.py discover_servers` when `discovery_client_django` is in `INSTALLED_APPS`; install with `[django]` extra.
 - **Configurable** — `ClientConfig` / `load_config()` with env vars (`DISCOVERY_CLIENT_*`) and runtime overrides; interface whitelist/blacklist.
 - **Cross-platform** — Windows, Linux, macOS. Optional deps: `netifaces` or `ifaddr` for interface enumeration, Django for the management command.
-- **Optional Fernet encryption** — Match server `DISCOVERY_ENCRYPTION_ENABLED` using the same pre-shared key; see [Optional encrypted discovery (Fernet)](#optional-encrypted-discovery-fernet).
+- **Optional Fernet encryption** — Match server `DISCOVERY_ENCRYPTION_ENABLED` using the same pre-shared key, with reply expiry, per-request nonces and key rotation; see [Optional encrypted discovery (Fernet)](#optional-encrypted-discovery-fernet).
 
 ---
 
@@ -142,6 +142,9 @@ Use `ClientConfig` or `load_config()`. Priority: **defaults** &lt; **environment
 | `DISCOVERY_CLIENT_INTERFACES_BLACKLIST` | Comma-separated interface names | `docker0,lo` |
 | `DISCOVERY_CLIENT_ENCRYPTION_ENABLED` or `DISCOVERY_ENCRYPTION_ENABLED` | Fernet discovery mode | `true` |
 | `DISCOVERY_CLIENT_SECRET_KEY` or `DISCOVERY_SECRET_KEY` | Fernet key (must match server) | (key from `Fernet.generate_key()`) |
+| `DISCOVERY_CLIENT_PREVIOUS_SECRET_KEYS` or `DISCOVERY_PREVIOUS_SECRET_KEYS` | Older Fernet keys still accepted during key rotation (comma-separated) | `<old-key>` |
+| `DISCOVERY_CLIENT_ENCRYPTION_TTL` | Encrypted mode: max reply age in seconds (default `30`) | `30` |
+| `DISCOVERY_CLIENT_ENCRYPTION_CLOCK_SKEW` | Encrypted mode: clock difference tolerated, seconds (default `10`) | `10` |
 
 Example with overrides:
 
@@ -177,6 +180,9 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 |----------|---------|
 | `DISCOVERY_CLIENT_ENCRYPTION_ENABLED` or `DISCOVERY_ENCRYPTION_ENABLED` | Enable Fernet mode (`true` / `1` / `yes` / `on`) |
 | `DISCOVERY_CLIENT_SECRET_KEY` or `DISCOVERY_SECRET_KEY` | Same Fernet key string as server `DISCOVERY_SECRET_KEY` |
+| `DISCOVERY_CLIENT_PREVIOUS_SECRET_KEYS` or `DISCOVERY_PREVIOUS_SECRET_KEYS` | Older keys still accepted while rotating (comma-separated) |
+| `DISCOVERY_CLIENT_ENCRYPTION_TTL` | Max age of an accepted reply, in seconds (default `30`) |
+| `DISCOVERY_CLIENT_ENCRYPTION_CLOCK_SKEW` | Clock difference tolerated in either direction, in seconds (default `10`) |
 
 **Django management command:**
 
@@ -186,6 +192,56 @@ python manage.py discover_servers --encryption
 ```
 
 The command sets `encryption_enabled`; the secret must come from the environment (or use `load_config()` / `ClientConfig` in code).
+
+### Replay and freshness protection
+
+In encrypted mode, every discovery round:
+
+- **Sends a fresh random nonce.** The request plaintext is `DISCOVER_SERVER|<nonce>`, where the nonce is 32 hex characters. When several interfaces are used, they share one nonce per round, but each request is encrypted separately.
+- **Accepts only replies that echo that nonce.** The server copies the nonce into its encrypted reply (`SERVER_IP:<ip>|<nonce>`). Replies with a missing or different nonce are dropped. This includes a genuine reply recorded from an earlier round and sent again.
+- **Drops old replies.** A reply is accepted only if its Fernet timestamp is within `encryption_ttl` seconds (default 30), with `encryption_clock_skew` seconds (default 10) of tolerance in either direction for clocks that disagree.
+
+Tampered tokens and tokens encrypted with an unknown key are dropped, as before. `DiscoveryResult.raw_response` holds the reply without the nonce, so it looks the same as in plain mode.
+
+```python
+from discovery_client import ClientConfig, discover
+
+config = ClientConfig(
+    encryption_enabled=True,
+    secret_key="<current key>",
+    encryption_ttl=30,          # seconds
+    encryption_clock_skew=10,   # seconds
+)
+servers = discover(config=config)
+```
+
+Keep clocks roughly in sync (for example with NTP). If a client's clock is off by more than the skew allowance, the server drops its requests and the client drops the server's replies.
+
+### Rotating the key
+
+`previous_secret_keys` lists older keys the client still accepts when decrypting replies. Requests are always encrypted with `secret_key`.
+
+```python
+config = ClientConfig(
+    encryption_enabled=True,
+    secret_key="<current key>",
+    previous_secret_keys=["<older key>"],
+)
+```
+
+Or set `DISCOVERY_CLIENT_PREVIOUS_SECRET_KEYS` (comma-separated). To rotate from key A to key B with no downtime, do the same three steps on servers and clients:
+
+1. **Add B everywhere** as a previous key, keeping A current.
+2. **Switch to B.** Make B current everywhere and move A to the previous keys.
+3. **Remove A** once every node uses B.
+
+Skipping step 1 breaks clients that only know A as soon as a server switches to B. Keys are never included in `repr(ClientConfig)`, so a config can be logged safely.
+
+### Compatibility
+
+- Plain mode is unchanged.
+- An encrypted client of this version **requires the server to echo its nonce**. It cannot discover encrypted servers older than this release, so upgrade servers first, or at the same time.
+- Updated servers still answer older encrypted clients that send no nonce.
 
 ---
 
