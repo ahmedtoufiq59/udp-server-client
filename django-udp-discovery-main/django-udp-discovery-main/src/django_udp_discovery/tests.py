@@ -14,6 +14,7 @@ Test Classes:
     UdpListenerTest: Tests for UDP listener service lifecycle and behavior.
     DiscoveryCryptoHardeningTest: Token TTL, tamper detection, replay cache, request parsing.
     EncryptedListenerHardeningTest: Listener nonce echo, replay, expiry and tamper handling.
+    KeyRotationTest: Previous-key acceptance and keyring configuration.
     StartDiscoveryCommandTest: Tests for the start_discovery management command.
 """
 
@@ -839,6 +840,124 @@ class EncryptedListenerHardeningTest(TestCase):
             self.assertEqual(
                 self._exchange(9968, b"DISCOVER_SERVER")[:10], b"SERVER_IP:"
             )
+
+
+class KeyRotationTest(TestCase):
+    """DISCOVERY_PREVIOUS_SECRET_KEYS: decrypt with old keys, always send with current."""
+
+    NONCE = b"0123456789abcdef0123456789abcdef"
+
+    def setUp(self) -> None:
+        if is_running():
+            stop_udp_service()
+        time.sleep(0.1)
+        self.old = Fernet.generate_key().decode("ascii")
+        self.new = Fernet.generate_key().decode("ascii")
+
+    def tearDown(self) -> None:
+        if is_running():
+            stop_udp_service()
+        time.sleep(0.1)
+
+    def _exchange(self, port: int, packet: bytes, timeout: float = 1.0):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(packet, ("127.0.0.1", port))
+            try:
+                return sock.recvfrom(4096)[0]
+            except socket.timeout:
+                return None
+        finally:
+            sock.close()
+
+    def _encrypted(self, port: int, **extra):
+        values = dict(
+            DISCOVERY_PORT=port,
+            DISCOVERY_MESSAGE="DISCOVER_SERVER",
+            RESPONSE_PREFIX="SERVER_IP:",
+            DISCOVERY_ENCRYPTION_ENABLED=True,
+            ENABLE_LOGGING=False,
+        )
+        values.update(extra)
+        return override_settings(**values)
+
+    # --- settings resolution -------------------------------------------------
+
+    def test_previous_keys_from_settings_list_and_string(self) -> None:
+        with override_settings(DISCOVERY_PREVIOUS_SECRET_KEYS=[self.old, " "]):
+            self.assertEqual(discovery_crypto.resolve_previous_secret_keys(), [self.old])
+        with override_settings(DISCOVERY_PREVIOUS_SECRET_KEYS=f"{self.old}, {self.new}"):
+            self.assertEqual(
+                discovery_crypto.resolve_previous_secret_keys(), [self.old, self.new]
+            )
+
+    def test_previous_keys_from_env(self) -> None:
+        with patch.dict(os.environ, {"DISCOVERY_PREVIOUS_SECRET_KEYS": self.old}):
+            self.assertEqual(discovery_crypto.resolve_previous_secret_keys(), [self.old])
+
+    def test_keyring_from_settings(self) -> None:
+        with override_settings(
+            DISCOVERY_SECRET_KEY=self.new, DISCOVERY_PREVIOUS_SECRET_KEYS=[self.old]
+        ):
+            ring = discovery_crypto.build_keyring_from_settings()
+        token = ring.encrypt(b"x")
+        self.assertEqual(Fernet(self.new.encode()).decrypt(token), b"x")
+        self.assertEqual(
+            discovery_crypto.decrypt_bytes(Fernet(self.old.encode()).encrypt(b"y"), ring),
+            b"y",
+        )
+
+    def test_keyring_errors(self) -> None:
+        with override_settings(DISCOVERY_SECRET_KEY="", DISCOVERY_PREVIOUS_SECRET_KEYS=[self.old]):
+            with self.assertRaises(ValueError):
+                discovery_crypto.build_keyring_from_settings()
+        with override_settings(DISCOVERY_SECRET_KEY=self.new, DISCOVERY_PREVIOUS_SECRET_KEYS=["bad"]):
+            with self.assertRaises(ValueError):
+                discovery_crypto.build_keyring_from_settings()
+        with override_settings(DISCOVERY_SECRET_KEY=self.new, DISCOVERY_PREVIOUS_SECRET_KEYS=42):
+            with self.assertRaises(ValueError):
+                discovery_crypto.build_keyring_from_settings()
+        with override_settings(DISCOVERY_SECRET_KEY=""):
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("DISCOVERY_PREVIOUS_SECRET_KEYS", None)
+                self.assertIsNone(discovery_crypto.build_keyring_from_settings())
+
+    # --- listener ------------------------------------------------------------
+
+    def test_server_accepts_old_key_and_replies_with_current(self) -> None:
+        """Rotation step 2: server already on the new key, client still on the old."""
+        with self._encrypted(
+            9955, DISCOVERY_SECRET_KEY=self.new, DISCOVERY_PREVIOUS_SECRET_KEYS=[self.old]
+        ):
+            start_udp_service()
+            time.sleep(0.35)
+            self.assertTrue(is_running())
+            request = Fernet(self.old.encode()).encrypt(b"DISCOVER_SERVER|" + self.NONCE)
+            reply = self._exchange(9955, request)
+            self.assertIsNotNone(reply)
+            plain = Fernet(self.new.encode()).decrypt(reply)
+            self.assertTrue(plain.endswith(b"|" + self.NONCE))
+
+    def test_server_rejects_old_key_once_removed(self) -> None:
+        """Rotation step 3: the old key is gone, so old-key requests get no reply."""
+        with self._encrypted(9956, DISCOVERY_SECRET_KEY=self.new):
+            start_udp_service()
+            time.sleep(0.35)
+            self.assertTrue(is_running())
+            request = Fernet(self.old.encode()).encrypt(b"DISCOVER_SERVER|" + self.NONCE)
+            self.assertIsNone(self._exchange(9956, request, timeout=0.5))
+
+    def test_listener_refuses_bad_rotation_config(self) -> None:
+        for extra in (
+            {"DISCOVERY_SECRET_KEY": self.new, "DISCOVERY_PREVIOUS_SECRET_KEYS": ["bad"]},
+            {"DISCOVERY_SECRET_KEY": "", "DISCOVERY_PREVIOUS_SECRET_KEYS": [self.old]},
+        ):
+            with self.subTest(extra=list(extra)), self._encrypted(9957, **extra):
+                start_udp_service()
+                time.sleep(0.45)
+                self.assertFalse(is_running())
+                stop_udp_service()
 
 
 class StartDiscoveryCommandTest(TestCase):

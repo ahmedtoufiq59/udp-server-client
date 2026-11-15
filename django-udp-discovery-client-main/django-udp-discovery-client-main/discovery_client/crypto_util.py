@@ -9,10 +9,13 @@ from __future__ import annotations
 import hmac
 import secrets
 import time
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 # pyrefly: ignore [missing-import]
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
+
+#: A single key or a rotation keyring; both expose encrypt/decrypt/extract_timestamp.
+FernetLike = Union[Fernet, MultiFernet]
 
 #: Default maximum age in seconds of an accepted response token.
 DEFAULT_TOKEN_TTL: float = 30.0
@@ -54,14 +57,33 @@ def build_fernet(secret: Union[str, bytes]) -> Fernet:
     return Fernet(validate_fernet_key(secret))
 
 
-def encrypt_payload(plaintext: bytes, fernet: Fernet) -> bytes:
+def build_keyring(
+    current_key: Union[str, bytes],
+    previous_keys: Sequence[Union[str, bytes]] = (),
+) -> MultiFernet:
+    """
+    Build a ``MultiFernet`` that encrypts with ``current_key`` and decrypts with it
+    or any of ``previous_keys`` (key rotation). Duplicates are dropped.
+
+    Raises:
+        TypeError / ValueError: If any key is not valid Fernet material.
+    """
+    ordered: List[bytes] = []
+    for material in (current_key, *previous_keys):
+        key_bytes = validate_fernet_key(material)
+        if key_bytes not in ordered:
+            ordered.append(key_bytes)
+    return MultiFernet([Fernet(k) for k in ordered])
+
+
+def encrypt_payload(plaintext: bytes, fernet: FernetLike) -> bytes:
     """Encrypt plaintext bytes."""
     return fernet.encrypt(plaintext)
 
 
 def decrypt_payload(
     token: bytes,
-    fernet: Fernet,
+    fernet: FernetLike,
     ttl: Optional[float] = DEFAULT_TOKEN_TTL,
     clock_skew: float = DEFAULT_CLOCK_SKEW,
     now: Optional[float] = None,

@@ -7,6 +7,17 @@ variable. Secret values are never logged.
 
 When ``DISCOVERY_ENCRYPTION_ENABLED`` is True, the UDP listener uses these helpers
 for wire encryption; otherwise they are optional for callers or tests.
+
+Key rotation:
+    ``DISCOVERY_PREVIOUS_SECRET_KEYS`` (settings list/tuple, or a comma-separated
+    string in settings or the environment) lists older keys that are still accepted
+    for decryption. Outgoing packets are always encrypted with ``DISCOVERY_SECRET_KEY``.
+    To rotate with no downtime:
+
+        1. Add the new key to every node's previous-keys list (still sending with the old).
+        2. Make the new key ``DISCOVERY_SECRET_KEY`` everywhere and move the old one to
+           the previous-keys list. Mixed nodes keep interoperating during the rollout.
+        3. Once every node has the new key as current, remove the old one.
 """
 from __future__ import annotations
 
@@ -18,10 +29,13 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 # pyrefly: ignore [missing-import]
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
+
+#: A single key or a rotation keyring; both expose encrypt/decrypt/extract_timestamp.
+FernetLike = Union[Fernet, MultiFernet]
 # pyrefly: ignore [missing-import]
 from django.conf import settings as django_settings
 
@@ -109,14 +123,14 @@ def build_fernet(key_material: Union[str, bytes]) -> Fernet:
     return Fernet(validate_fernet_key(key_material))
 
 
-def encrypt_bytes(plaintext: bytes, fernet: Fernet) -> bytes:
+def encrypt_bytes(plaintext: bytes, fernet: FernetLike) -> bytes:
     """Encrypt plaintext bytes."""
     return fernet.encrypt(plaintext)
 
 
 def decrypt_bytes(
     token: bytes,
-    fernet: Fernet,
+    fernet: FernetLike,
     ttl: Optional[float] = DEFAULT_TOKEN_TTL,
     clock_skew: float = DEFAULT_CLOCK_SKEW,
     now: Optional[float] = None,
@@ -126,7 +140,8 @@ def decrypt_bytes(
 
     Args:
         token: Fernet token bytes.
-        fernet: ``Fernet`` instance for the shared key.
+        fernet: ``Fernet`` for one key, or ``MultiFernet`` to accept any key in a
+            rotation keyring.
         ttl: Maximum token age in seconds. ``None`` disables the age check
             (signature is still verified).
         clock_skew: Seconds of clock difference tolerated in both directions:
@@ -275,3 +290,81 @@ def build_fernet_from_settings() -> Optional[Fernet]:
     if key_bytes is None:
         return None
     return Fernet(key_bytes)
+
+
+def _split_key_list(raw: Union[str, bytes, Sequence[Union[str, bytes]], None]) -> List[str]:
+    """Normalize a list/tuple or comma-separated string of keys; drop blanks."""
+    if raw is None:
+        return []
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        items = raw.split(",")
+    elif isinstance(raw, (list, tuple)):
+        items = [i.decode("utf-8") if isinstance(i, bytes) else str(i) for i in raw]
+    else:
+        raise TypeError(
+            "DISCOVERY_PREVIOUS_SECRET_KEYS must be a list, tuple or comma-separated string"
+        )
+    return [i.strip() for i in items if i and i.strip()]
+
+
+def resolve_previous_secret_keys() -> List[str]:
+    """
+    Return older keys still accepted for decryption, oldest-last as configured.
+
+    Resolution order mirrors :func:`resolve_discovery_secret_key_string`:
+    ``settings.DISCOVERY_PREVIOUS_SECRET_KEYS`` when that attribute exists, else the
+    ``DISCOVERY_PREVIOUS_SECRET_KEYS`` environment variable (comma-separated).
+    """
+    if hasattr(django_settings, "DISCOVERY_PREVIOUS_SECRET_KEYS"):
+        return _split_key_list(django_settings.DISCOVERY_PREVIOUS_SECRET_KEYS)
+    return _split_key_list(os.environ.get("DISCOVERY_PREVIOUS_SECRET_KEYS"))
+
+
+def build_keyring(
+    current_key: Union[str, bytes],
+    previous_keys: Sequence[Union[str, bytes]] = (),
+) -> MultiFernet:
+    """
+    Build a ``MultiFernet`` that encrypts with ``current_key`` and decrypts with
+    ``current_key`` or any of ``previous_keys``. Duplicates are dropped.
+
+    Raises:
+        ValueError / TypeError: If any key is not valid Fernet material.
+    """
+    ordered: List[bytes] = []
+    for material in (current_key, *previous_keys):
+        key_bytes = validate_fernet_key(material)
+        if key_bytes not in ordered:
+            ordered.append(key_bytes)
+    return MultiFernet([Fernet(k) for k in ordered])
+
+
+def build_keyring_from_settings() -> Optional[MultiFernet]:
+    """
+    Build the rotation keyring from ``DISCOVERY_SECRET_KEY`` and
+    ``DISCOVERY_PREVIOUS_SECRET_KEYS``.
+
+    Returns:
+        ``MultiFernet`` when a current key is configured, else ``None``.
+
+    Raises:
+        ValueError: If any configured key is invalid, or previous keys are set
+            without a current key.
+    """
+    current = resolve_discovery_secret_key_string()
+    try:
+        previous = resolve_previous_secret_keys()
+    except TypeError as exc:
+        raise ValueError(str(exc)) from exc
+    if not current:
+        if previous:
+            raise ValueError(
+                "DISCOVERY_PREVIOUS_SECRET_KEYS is set but DISCOVERY_SECRET_KEY is not."
+            )
+        return None
+    try:
+        return build_keyring(current, previous)
+    except TypeError as exc:
+        raise ValueError("Invalid Fernet key format.") from exc

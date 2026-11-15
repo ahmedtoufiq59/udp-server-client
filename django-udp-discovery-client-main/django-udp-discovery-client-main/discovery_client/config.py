@@ -53,6 +53,10 @@ class ClientConfig:
         secret_key: Fernet key (``Fernet.generate_key()`` string). Required when
             ``encryption_enabled`` is True. Env: ``DISCOVERY_CLIENT_SECRET_KEY`` or
             ``DISCOVERY_SECRET_KEY`` (fallback for parity with server env).
+        previous_secret_keys: Encrypted mode only. Older Fernet keys still accepted when
+            decrypting responses during key rotation; requests always use ``secret_key``.
+            Env: ``DISCOVERY_CLIENT_PREVIOUS_SECRET_KEYS`` or ``DISCOVERY_PREVIOUS_SECRET_KEYS``
+            (comma-separated).
         encryption_ttl: Encrypted mode only. Maximum age in seconds of an accepted
             response token (default: 30). Env: ``DISCOVERY_CLIENT_ENCRYPTION_TTL``.
         encryption_clock_skew: Encrypted mode only. Seconds of clock difference
@@ -68,7 +72,9 @@ class ClientConfig:
     interfaces_whitelist: Optional[List[str]] = None
     interfaces_blacklist: Optional[List[str]] = None
     encryption_enabled: bool = False
-    secret_key: Optional[str] = None
+    # Keys are kept out of repr() so configs can be logged safely.
+    secret_key: Optional[str] = field(default=None, repr=False)
+    previous_secret_keys: Optional[List[str]] = field(default=None, repr=False)
     encryption_ttl: float = 30.0
     encryption_clock_skew: float = 10.0
     _fernet: Any = field(init=False, repr=False, compare=False, default=None)
@@ -120,9 +126,16 @@ class ClientConfig:
                     "encryption_enabled requires a non-empty secret_key "
                     "(DISCOVERY_CLIENT_SECRET_KEY / DISCOVERY_SECRET_KEY or secret_key=...)"
                 )
-            from discovery_client.crypto_util import build_fernet
+            from discovery_client.crypto_util import build_keyring
 
-            object.__setattr__(self, "_fernet", build_fernet(str(self.secret_key).strip()))
+            previous = self.previous_secret_keys or []
+            if isinstance(previous, (str, bytes)):
+                raise TypeError("previous_secret_keys must be a list of keys, not a string")
+            object.__setattr__(
+                self,
+                "_fernet",
+                build_keyring(str(self.secret_key).strip(), previous),
+            )
         else:
             object.__setattr__(self, "_fernet", None)
     
@@ -229,6 +242,15 @@ class ClientConfig:
                 sk = os.environ.get("DISCOVERY_SECRET_KEY")
             if sk:
                 config_dict['secret_key'] = sk.strip()
+
+        if 'previous_secret_keys' not in overrides:
+            prev = os.environ.get(f"{env_prefix}PREVIOUS_SECRET_KEYS")
+            if not prev:
+                prev = os.environ.get("DISCOVERY_PREVIOUS_SECRET_KEYS")
+            if prev:
+                keys = _parse_list(prev)
+                if keys:
+                    config_dict['previous_secret_keys'] = keys
 
         if 'encryption_ttl' not in overrides:
             ttl = os.environ.get(f"{env_prefix}ENCRYPTION_TTL")

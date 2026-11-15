@@ -19,6 +19,10 @@ Available Settings:
     DISCOVERY_SECRET_KEY (str): Optional Fernet key for encrypted discovery (default: "").
         If empty, ``django_udp_discovery.crypto`` falls back to the ``DISCOVERY_SECRET_KEY``
         environment variable. Use a key from ``Fernet.generate_key()``; never commit real keys.
+    DISCOVERY_PREVIOUS_SECRET_KEYS (list | str): Older Fernet keys still accepted for
+        decryption during key rotation (list/tuple, or comma-separated string). Outgoing
+        packets always use DISCOVERY_SECRET_KEY. Falls back to the environment variable of
+        the same name when not set in Django settings. Default: not set.
     DISCOVERY_ENCRYPTION_ENABLED (bool): When True, discovery requests and responses use
         Fernet (see ``django_udp_discovery.crypto``). Requires a valid ``DISCOVERY_SECRET_KEY``.
         Default: False (plain UDP, backward compatible).

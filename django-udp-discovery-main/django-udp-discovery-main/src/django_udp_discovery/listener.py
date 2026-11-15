@@ -56,7 +56,7 @@ from django_udp_discovery.conf import settings
 from django_udp_discovery.crypto import (
     NONCE_SEPARATOR,
     ReplayCache,
-    build_fernet_from_settings,
+    build_keyring_from_settings,
     decrypt_bytes,
     encrypt_bytes,
     parse_discovery_request,
@@ -149,11 +149,13 @@ def _udp_listener_worker() -> None:
             if settings.ENABLE_LOGGING:
                 logger.info("UDP Discovery: encryption enabled (Fernet)")
             try:
-                fernet = build_fernet_from_settings()
-            except ValueError:
+                fernet = build_keyring_from_settings()
+            except ValueError as exc:
+                # The message never contains key material.
                 logger.error(
-                    "UDP Discovery: DISCOVERY_SECRET_KEY is set but invalid; "
-                    "cannot start encrypted listener."
+                    "UDP Discovery: invalid DISCOVERY_SECRET_KEY / "
+                    "DISCOVERY_PREVIOUS_SECRET_KEYS (%s); cannot start encrypted listener.",
+                    exc,
                 )
                 return
             if fernet is None:
